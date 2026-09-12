@@ -98,6 +98,8 @@ class GeminiLiveSessionTest {
             client = client,
             scope = CoroutineScope(SupervisorJob() + Dispatchers.Default),
             watchdogTimeoutMs = watchdogTimeoutMs,
+            // Tests exercise the spec §4.4 fatal-watchdog contract regardless of the demo default.
+            watchdogFatal = true,
             socketDeadTimeoutMs = socketDeadTimeoutMs,
             wsUrlBase = wsUrl(),
         )

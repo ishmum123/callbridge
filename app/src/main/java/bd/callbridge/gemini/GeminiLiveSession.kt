@@ -71,6 +71,9 @@ class GeminiLiveSession(
     private val client: OkHttpClient = defaultClient,
     private val scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Default),
     private val watchdogTimeoutMs: Long = 8_000L,
+    /** When false (demo default, see [bd.callbridge.Config.WATCHDOG_FATAL]) a watchdog expiry
+     *  logs and clears the outstanding flag instead of failing the session. */
+    private val watchdogFatal: Boolean = bd.callbridge.Config.WATCHDOG_FATAL,
     private val socketDeadTimeoutMs: Long = 60_000L,
     private val setupTimeoutMs: Long = 20_000L,
     private val nowMs: () -> Long = System::currentTimeMillis,
@@ -266,7 +269,7 @@ class GeminiLiveSession(
         responseWatchdogJob = scope.launch {
             delay(watchdogTimeoutMs)
             val message = "Watchdog: model response outstanding with no frame for ${watchdogTimeoutMs}ms"
-            if (!bd.callbridge.Config.WATCHDOG_FATAL) {
+            if (!watchdogFatal) {
                 // Demo mode: a stalled turn must not end the call. Log, clear the outstanding
                 // flag so the next caller utterance can re-arm, and keep the socket open.
                 Log.w(TAG, "$message — non-fatal (Config.WATCHDOG_FATAL=false), keeping session open")
