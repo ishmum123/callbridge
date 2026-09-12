@@ -10,6 +10,8 @@ import bd.callbridge.store.dao.CallDao
 import bd.callbridge.store.dao.PatientProfileDao
 import bd.callbridge.store.dao.ProfileUpdateDao
 import bd.callbridge.store.dao.TurnDao
+import bd.callbridge.util.Redact
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.Serializable
@@ -27,6 +29,7 @@ import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import java.util.concurrent.TimeUnit
 
 /**
  * Demo "Patient profile" feature (not in the original spec). After a call finishes, merges that
@@ -52,13 +55,22 @@ class ProfileSummarizer(
     private val profileUpdateDao: ProfileUpdateDao,
     private val apiKey: () -> String,
     private val modelId: String = Config.GEMINI_SUMMARY_MODEL_ID,
-    private val client: OkHttpClient = OkHttpClient(),
+    private val client: OkHttpClient = OkHttpClient.Builder()
+        .callTimeout(CALL_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+        .build(),
     private val nowMs: () -> Long = System::currentTimeMillis,
 ) {
-    suspend fun onCallFinished(callId: Long) {
+    /**
+     * @param force Bypasses the idempotency check (a [ProfileUpdateEntity] row already existing
+     * for [callId]) so the debug `DEBUG_SUMMARIZE` broadcast can re-run one call on demand without
+     * inflating [PatientProfileEntity.callCount] on the normal path (see class doc + n7 fix).
+     */
+    suspend fun onCallFinished(callId: Long, force: Boolean = false) {
         withContext(Dispatchers.IO) {
             try {
-                run(callId)
+                run(callId, force)
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
                 // Never throw to the caller (docs above) — this is a best-effort demo enrichment,
                 // not something that may ever take down a live call.
@@ -67,7 +79,7 @@ class ProfileSummarizer(
         }
     }
 
-    private suspend fun run(callId: Long) {
+    private suspend fun run(callId: Long, force: Boolean) {
         val call = callDao.findById(callId)
         if (call == null) {
             Log.w(TAG, "onCallFinished($callId): no such call, skipping")
@@ -78,21 +90,35 @@ class ProfileSummarizer(
             Log.i(TAG, "onCallFinished($callId): empty transcript, skipping")
             return
         }
+        if (!force && profileUpdateDao.existsForCall(callId)) {
+            Log.i(TAG, "onCallFinished($callId): already summarized (profile_updates row exists), skipping")
+            return
+        }
 
         val existing = profileDao.find(call.number)
         val requestJson = buildRequestBody(existing, turns)
 
-        val result = runCatching { callGenerateContent(requestJson) }
-            .onFailure { Log.e(TAG, "onCallFinished($callId): generateContent call failed", it) }
-            .getOrNull()
+        val callResult = runCatching { callGenerateContent(requestJson) }
+        callResult.onFailure {
+            Log.e(TAG, "onCallFinished($callId): generateContent call failed: ${it.message?.take(LOG_PREVIEW_CHARS)}")
+        }
+        val result = callResult.getOrNull()
 
         if (result == null) {
-            recordError(call.number, existing, "generateContent call failed (see logcat)")
+            val reason = callResult.exceptionOrNull()?.message?.take(LOG_PREVIEW_CHARS) ?: "unknown"
+            recordError(call.number, existing, "generateContent call failed: $reason")
             return
         }
 
         val parsed = runCatching { parseGeneratedUpdate(result) }
-            .onFailure { Log.e(TAG, "onCallFinished($callId): failed to parse model output: $result", it) }
+            .onFailure {
+                Log.e(
+                    TAG,
+                    "onCallFinished($callId): failed to parse model output " +
+                        "(len=${result.length}, preview=${result.take(LOG_PREVIEW_CHARS)})",
+                    it,
+                )
+            }
             .getOrNull()
 
         if (parsed == null) {
@@ -100,24 +126,36 @@ class ProfileSummarizer(
             return
         }
 
+        // Replace (not duplicate) this call's prior update row before counting/inserting —
+        // relevant only on the force path (a no-op otherwise, since the idempotency check above
+        // already ruled out an existing row for this callId). Doing this before countForNumber
+        // below is what keeps callCount at "distinct calls processed" rather than growing every
+        // time the same call is force-re-summarized.
+        profileUpdateDao.deleteForCall(callId)
+
         val merged = PatientProfileEntity(
             number = call.number,
             displayName = parsed.displayName ?: existing?.displayName,
             ageYears = parsed.ageYears ?: existing?.ageYears,
             sex = parsed.sex ?: existing?.sex,
             village = parsed.village ?: existing?.village,
-            chronicConditions = parsed.chronicConditions,
+            // Accumulate semantics enforced in code (not left to the model): union of existing +
+            // model output, case-insensitive dedupe, order preserved. currentSymptoms and the
+            // follow-up/summary fields stay model-authoritative (latest assessment wins).
+            chronicConditions = unionCaseInsensitive(existing?.chronicConditions, parsed.chronicConditions),
             currentSymptoms = parsed.currentSymptoms,
-            medications = parsed.medications,
-            allergies = parsed.allergies,
-            riskFlags = parsed.riskFlags,
-            adviceGiven = parsed.adviceGiven,
+            medications = unionCaseInsensitive(existing?.medications, parsed.medications),
+            allergies = unionCaseInsensitive(existing?.allergies, parsed.allergies),
+            riskFlags = unionCaseInsensitive(existing?.riskFlags, parsed.riskFlags),
+            adviceGiven = unionCaseInsensitive(existing?.adviceGiven, parsed.adviceGiven),
             followUpNeeded = parsed.followUpNeeded,
             followUpNote = parsed.followUpNote,
             summaryBn = parsed.summaryBn,
             summaryEn = parsed.summaryEn,
             lastUpdated = nowMs(),
-            callCount = (existing?.callCount ?: 0) + 1,
+            // Derived from profile_updates rows for this number, not incremented per run, so a
+            // debug force-rerun of one call never double counts (n7 fix).
+            callCount = profileUpdateDao.countForNumber(call.number) + 1,
             lastError = null,
         )
         profileDao.upsert(merged)
@@ -129,7 +167,20 @@ class ProfileSummarizer(
                 deltaSummary = parsed.deltaSummary,
             )
         )
-        Log.i(TAG, "onCallFinished($callId): profile updated for ${call.number}, callCount=${merged.callCount}")
+        Log.i(TAG, "onCallFinished($callId): profile updated for ${Redact.phone(call.number)}, callCount=${merged.callCount}")
+    }
+
+    /** Case-insensitive union of [existing] + [incoming], preserving first-seen order, used for
+     *  the list fields that must only ever accumulate (never shrink) across calls. */
+    private fun unionCaseInsensitive(existing: List<String>?, incoming: List<String>): List<String> {
+        val seen = mutableSetOf<String>()
+        val out = mutableListOf<String>()
+        for (item in (existing ?: emptyList()) + incoming) {
+            val trimmed = item.trim()
+            if (trimmed.isEmpty()) continue
+            if (seen.add(trimmed.lowercase())) out.add(trimmed)
+        }
+        return out
     }
 
     private suspend fun recordError(number: String, existing: PatientProfileEntity?, message: String) {
@@ -150,16 +201,34 @@ class ProfileSummarizer(
         client.newCall(request).execute().use { response ->
             val bodyStr = response.body?.string().orEmpty()
             if (!response.isSuccessful) {
-                error("generateContent HTTP ${response.code}: $bodyStr")
+                // Never surface the full HTTP body (may contain echoed request content / PII) —
+                // length + a short preview is enough to diagnose from logcat.
+                error(
+                    "generateContent HTTP ${response.code}: len=${bodyStr.length} " +
+                        "preview=${bodyStr.take(LOG_PREVIEW_CHARS)}"
+                )
             }
             val root = json.parseToJsonElement(bodyStr).jsonObject
-            val text = root["candidates"]?.jsonArray
-                ?.firstOrNull()?.jsonObject
+            val candidate = root["candidates"]?.jsonArray?.firstOrNull()?.jsonObject
+
+            val finishReason = candidate?.get("finishReason")?.jsonPrimitive?.content
+            Log.i(TAG, "callGenerateContent: finishReason=$finishReason")
+            if (finishReason == "MAX_TOKENS") {
+                error("generateContent finishReason=MAX_TOKENS (output truncated)")
+            }
+
+            // Concatenate every part's text (not just parts[0]) — the model can split its JSON
+            // output across multiple parts.
+            val text = candidate
                 ?.get("content")?.jsonObject
                 ?.get("parts")?.jsonArray
-                ?.firstOrNull()?.jsonObject
-                ?.get("text")?.jsonPrimitive?.content
-            return text ?: error("no candidates[0].content.parts[0].text in response: $bodyStr")
+                ?.mapNotNull { it.jsonObject["text"]?.jsonPrimitive?.content }
+                ?.joinToString("")
+                ?.takeIf { it.isNotEmpty() }
+            return text ?: error(
+                "no candidates[0].content.parts[*].text in response: len=${bodyStr.length} " +
+                    "preview=${bodyStr.take(LOG_PREVIEW_CHARS)}"
+            )
         }
     }
 
@@ -241,6 +310,8 @@ class ProfileSummarizer(
 
     companion object {
         private const val TAG = "ProfileSummarizer"
+        private const val LOG_PREVIEW_CHARS = 80
+        private const val CALL_TIMEOUT_SECONDS = 30L
         private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
         val json = Json { ignoreUnknownKeys = true; explicitNulls = false }
 

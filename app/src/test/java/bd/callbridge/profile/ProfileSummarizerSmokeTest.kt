@@ -68,6 +68,9 @@ class ProfileSummarizerSmokeTest {
         override suspend fun insert(update: ProfileUpdateEntity): Long { inserted = update; return 1L }
         override fun observeForNumber(number: String): Flow<List<ProfileUpdateEntity>> = flowOf(listOfNotNull(inserted))
         override suspend fun forNumber(number: String): List<ProfileUpdateEntity> = listOfNotNull(inserted)
+        override suspend fun existsForCall(callId: Long): Boolean = inserted?.callId == callId
+        override suspend fun countForNumber(number: String): Int = if (inserted?.number == number) 1 else 0
+        override suspend fun deleteForCall(callId: Long) { if (inserted?.callId == callId) inserted = null }
     }
 
     @Test

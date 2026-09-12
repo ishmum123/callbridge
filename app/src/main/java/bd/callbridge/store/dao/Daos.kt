@@ -80,4 +80,20 @@ interface ProfileUpdateDao {
 
     @Query("SELECT * FROM profile_updates WHERE number = :number ORDER BY timestamp DESC")
     suspend fun forNumber(number: String): List<ProfileUpdateEntity>
+
+    /** Idempotency check for [bd.callbridge.profile.ProfileSummarizer.onCallFinished]: whether
+     *  this call has already produced a profile_updates row. */
+    @Query("SELECT EXISTS(SELECT 1 FROM profile_updates WHERE callId = :callId)")
+    suspend fun existsForCall(callId: Long): Boolean
+
+    /** Number of distinct calls that have contributed an update to this number's profile so far
+     *  — the source of truth for [PatientProfileEntity.callCount] (never an incrementing counter,
+     *  so re-summarizing one call doesn't double count it). */
+    @Query("SELECT COUNT(*) FROM profile_updates WHERE number = :number")
+    suspend fun countForNumber(number: String): Int
+
+    /** Used by the `force=true` re-summarize path to replace (not duplicate) a call's prior
+     *  update row before inserting the fresh one. */
+    @Query("DELETE FROM profile_updates WHERE callId = :callId")
+    suspend fun deleteForCall(callId: Long)
 }
