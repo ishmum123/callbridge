@@ -18,6 +18,10 @@ object Config {
      *  is the server's Interrupted event). LOCAL_VAD keeps the energy-gate path selectable. */
     val vadMode: bd.callbridge.gemini.VadMode = bd.callbridge.gemini.VadMode.GEMINI_VAD
 
+    /** Demo 2026-09-12: half-duplex — caller audio is not sent while the model speaks and the
+     *  server is told NO_INTERRUPTION. Trades barge-in for robustness against line echo + noise. */
+    const val HALF_DUPLEX: Boolean = true
+
     /** Verified Gemini Live model ids (2026-09-12). [GEMINI_MODEL_ID] is the primary model the
      *  Gemini-session worker (M2) should open; [GEMINI_MODEL_FALLBACK] is used if the primary
      *  model/region is unavailable. Audio contract unchanged: 16 kHz PCM16 in, 24 kHz PCM16 out

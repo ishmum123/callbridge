@@ -238,6 +238,10 @@ class BridgeSession(
     private fun handlePipelineEvent(event: AudioPipeline.PipelineEvent) {
         when (event) {
             is AudioPipeline.PipelineEvent.Chunk -> {
+                // HALF_DUPLEX demo mode: while the model is speaking, don't feed caller-side audio
+                // to Gemini at all — the GSM downlink carries echo of our own injected reply and
+                // venue noise, which the server VAD read as barge-in (greeting cut at 640 ms).
+                if (Config.HALF_DUPLEX && isModelSpeaking) return
                 liveSession.sendAudio(event.pcm)
                 transcriptRecorder.onAudioSent(event.pcm)
             }

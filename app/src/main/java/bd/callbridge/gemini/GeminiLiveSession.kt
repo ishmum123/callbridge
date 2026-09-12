@@ -144,7 +144,8 @@ class GeminiLiveSession(
                     automaticActivityDetection = AutomaticActivityDetection(
                         disabled = vadMode == VadMode.LOCAL_VAD,
                     ),
-                    activityHandling = "START_OF_ACTIVITY_INTERRUPTS",
+                    // HALF_DUPLEX demo mode: never let (possibly echoed/noisy) caller audio cut a reply.
+                    activityHandling = if (bd.callbridge.Config.HALF_DUPLEX) "NO_INTERRUPTION" else "START_OF_ACTIVITY_INTERRUPTS",
                 ),
                 tools = if (tools.isNotEmpty()) listOf(Tool(functionDeclarations = tools)) else emptyList(),
             ),

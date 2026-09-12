@@ -86,7 +86,15 @@ data class RealtimeInputConfig(
 )
 
 @Serializable
-data class AutomaticActivityDetection(val disabled: Boolean)
+data class AutomaticActivityDetection(
+    val disabled: Boolean,
+    /** Demo tuning 2026-09-12: LOW start sensitivity so line noise / echo of our own injected
+     *  audio doesn't register as caller speech (observed: greeting interrupted 640 ms in). */
+    val startOfSpeechSensitivity: String = "START_SENSITIVITY_LOW",
+    val endOfSpeechSensitivity: String = "END_SENSITIVITY_HIGH",
+    val prefixPaddingMs: Int = 300,
+    val silenceDurationMs: Int = 600,
+)
 
 @Serializable
 data class RealtimeInputEnvelope(val realtimeInput: RealtimeInputPayload)
