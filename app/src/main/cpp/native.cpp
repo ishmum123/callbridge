@@ -1,6 +1,7 @@
-// M0 stub. The real injection shim (Route A: AUDIO_OUTPUT_FLAG_INCALL_MUSIC via
-// libaudioclient.so dlsym, per spec §4.3) lands here in M1b. Kept minimal so the
-// scaffold links and the Gradle/CMake toolchain is proven end to end.
+// M0 stub, kept minimal so the scaffold links and the Gradle/CMake toolchain is proven end to
+// end. M1b's real native work (Route A research probe, ALSA mixer control helper) lives in
+// audioclient_probe.cpp and alsa_mixer.cpp respectively — see those files for the full
+// reasoning on why Route A stops at a probe rather than a full native AudioTrack shim.
 #include <jni.h>
 #include <string>
 

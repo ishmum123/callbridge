@@ -1,0 +1,104 @@
+package bd.callbridge.audio
+
+import android.content.Context
+import android.media.AudioAttributes
+import android.media.AudioFormat
+import android.media.AudioManager
+import android.media.AudioTrack
+import android.util.Log
+
+/**
+ * Route C (spec §4.3): plays straight to the device's default speaker/media output. Used only
+ * with the physical padded-box loopback rig (call on speakerphone, a second phone/laptop's mic
+ * feeds the Gemini bridge) — this class does no call routing at all, it is just a normal media
+ * `AudioTrack`. Always works; lowest quality; last-resort fallback per spec §4.3/§7 M1b, used
+ * only if both Route B and Route A fail (Route A never succeeds on this OS version, see
+ * [IncallMusicInjector], so in practice this is the fallback for Route B failing).
+ */
+class LoopbackInjector(@Suppress("UNUSED_PARAMETER") context: Context) : Injector {
+    override val route: InjectorRoute = InjectorRoute.LOOPBACK
+
+    private var track: AudioTrack? = null
+    private var lastDetail = "not opened yet"
+
+    override fun open() {
+        if (track != null) return
+        track = buildTrack().also {
+            if (it == null) {
+                lastDetail = "AudioTrack construction failed at $SAMPLE_RATE_HZ Hz/mono"
+                Log.w(TAG, lastDetail)
+            } else {
+                lastDetail = "playing to default speaker/media output (no call routing)"
+                it.play()
+            }
+        }
+    }
+
+    private fun buildTrack(): AudioTrack? {
+        return try {
+            val attrs = AudioAttributes.Builder()
+                .setUsage(AudioAttributes.USAGE_MEDIA)
+                .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                .build()
+            val format = AudioFormat.Builder()
+                .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                .setSampleRate(SAMPLE_RATE_HZ)
+                .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                .build()
+            val minBuf = AudioTrack.getMinBufferSize(
+                SAMPLE_RATE_HZ,
+                AudioFormat.CHANNEL_OUT_MONO,
+                AudioFormat.ENCODING_PCM_16BIT,
+            )
+            if (minBuf <= 0) return null
+            val newTrack = AudioTrack(
+                attrs,
+                format,
+                minBuf * BUFFER_SIZE_MULTIPLIER,
+                AudioTrack.MODE_STREAM,
+                AudioManager.AUDIO_SESSION_ID_GENERATE,
+            )
+            if (newTrack.state != AudioTrack.STATE_INITIALIZED) {
+                newTrack.release()
+                return null
+            }
+            newTrack
+        } catch (e: Exception) {
+            Log.w(TAG, "buildTrack() threw", e)
+            null
+        }
+    }
+
+    override fun write(pcm: ShortArray) {
+        track?.write(pcm, 0, pcm.size)
+    }
+
+    override fun flush() {
+        val activeTrack = track ?: return
+        activeTrack.pause()
+        activeTrack.flush()
+        activeTrack.play()
+    }
+
+    override fun close() {
+        track?.let {
+            it.stop()
+            it.release()
+        }
+        track = null
+    }
+
+    override fun probe(): RouteProbe = RouteProbe(
+        route = route,
+        deviceFound = true,
+        preferredDeviceSet = true,
+        routedDeviceId = track?.routedDevice?.id,
+        detail = lastDetail,
+    )
+
+    companion object {
+        private const val TAG = "LoopbackInjector"
+        private const val SAMPLE_RATE_HZ = 16_000
+        private const val BUFFER_SIZE_MULTIPLIER = 4
+    }
+}
