@@ -57,6 +57,10 @@ class ProfileSummarizer(
     private val modelId: String = Config.GEMINI_SUMMARY_MODEL_ID,
     private val client: OkHttpClient = OkHttpClient.Builder()
         .callTimeout(CALL_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+        // OkHttp's default 10 s read timeout was killing every attempt: gemini-2.5-flash with a
+        // JSON schema takes ~10 s to first byte on this network (observed 2026-09-12).
+        .connectTimeout(20, TimeUnit.SECONDS)
+        .readTimeout(CALL_TIMEOUT_SECONDS, TimeUnit.SECONDS)
         .build(),
     private val nowMs: () -> Long = System::currentTimeMillis,
     /** Backoff before each attempt (first entry is the initial attempt). Tests pass a single 0. */
@@ -308,6 +312,8 @@ class ProfileSummarizer(
             })
             put("generationConfig", buildJsonObject {
                 put("responseMimeType", "application/json")
+                // No thinking for a structured merge: cuts time-to-first-byte substantially.
+                put("thinkingConfig", buildJsonObject { put("thinkingBudget", 0) })
                 put("responseSchema", RESPONSE_SCHEMA)
             })
         }
