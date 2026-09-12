@@ -266,6 +266,13 @@ class GeminiLiveSession(
         responseWatchdogJob = scope.launch {
             delay(watchdogTimeoutMs)
             val message = "Watchdog: model response outstanding with no frame for ${watchdogTimeoutMs}ms"
+            if (!bd.callbridge.Config.WATCHDOG_FATAL) {
+                // Demo mode: a stalled turn must not end the call. Log, clear the outstanding
+                // flag so the next caller utterance can re-arm, and keep the socket open.
+                Log.w(TAG, "$message — non-fatal (Config.WATCHDOG_FATAL=false), keeping session open")
+                responseOutstanding = false
+                return@launch
+            }
             markTerminal(SessionTerminalState.Failed(message))
             emitChecked(LiveSessionEvent.Error(message))
             close()

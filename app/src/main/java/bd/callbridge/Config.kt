@@ -22,6 +22,10 @@ object Config {
      *  server is told NO_INTERRUPTION. Trades barge-in for robustness against line echo + noise. */
     const val HALF_DUPLEX: Boolean = true
 
+    /** Demo 2026-09-12: the 8 s response watchdog logs instead of failing the session (a stalled
+     *  Gemini turn was hanging up live calls). Set true to restore spec §4.4 behaviour. */
+    const val WATCHDOG_FATAL: Boolean = false
+
     /** Verified Gemini Live model ids (2026-09-12). [GEMINI_MODEL_ID] is the primary model the
      *  Gemini-session worker (M2) should open; [GEMINI_MODEL_FALLBACK] is used if the primary
      *  model/region is unavailable. Audio contract unchanged: 16 kHz PCM16 in, 24 kHz PCM16 out

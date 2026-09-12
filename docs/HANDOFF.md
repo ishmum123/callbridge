@@ -1,67 +1,83 @@
-# CallBridge — session handoff (2026-09-12, updated)
+# CallBridge — session handoff (2026-09-12, 15:05, demo day)
 
-Authoritative running state. Read this + `docs/STATUS.md` + `docs/injection-routes.md` + `docs/gemini-live.md` + `docs/hal-recon.md` + `docs/device-log.md` before continuing. Spec is `callbridge-spec.md`.
+Authoritative running state. Read this + `docs/STATUS.md` + `docs/gemini-live.md` + `docs/gemini-tools.md` + `docs/injection-routes.md` before continuing. Spec is `callbridge-spec.md` (farming helpline); **the demo scope has pivoted to a Bangla HEALTH helpline** (user decision 2026-09-12).
 
-## Where we are
+## Where we are (one paragraph)
 
-Milestones M0, M1a, M1b (code), M2 (code) are built **and all merged to `main`** (@ `6868968`, pushed). The M2 and M1b fix branches from the prior session are finished, green, and merged; their worktrees are removed. Injection (the project's one hard problem) is committed as **Route B (Telephony Tx) primary** and is **not yet proven on device** — that is the single most important open task.
+Full pipeline runs end-to-end on the phone: GSM call auto-answered → caller audio captured (VOICE_DOWNLINK, 8 kHz) → Gemini Live (`gemini-3.1-flash-live-preview`, voice Sulafat, bn-IN) → reply resampled 24→16 kHz → injected into the call via **Route B (AudioTrack preferred device TYPE_TELEPHONY), proven audible on the far phone**. First real conversation happened at 14:37 (round-trip 0.4–1.3 s). Health-only prompt + `lookup_health_info` tool (Exa → OpenAI fallback) + per-caller **patient profile** (Gemini REST summarizer after each call, "Patients" screen in the app) are merged and installed. The remaining problem is **turn-taking on a real GSM line**: line echo of our own injected audio + venue noise gets read as caller speech.
 
-**Route A2 (call-redirection) was NOT recovered.** The prior session's notes described in-flight A2 work (a `CallRedirectionInjector` + `CALL_AUDIO_INTERCEPTION` permission), but it was never committed and is not in any branch, worktree, stash, or reflog — it is lost. What is committed is Route B/C + a researched-dead Route A (`IncallMusicInjector`). A2 remains an unimplemented idea; see Injection below.
+## Demo build state (installed on phone, `main` @ HEAD, pushed)
 
-| Milestone | State |
+`Config.kt` demo switches (all set for the demo):
+
+| Switch | Value | Why |
+|---|---|---|
+| `injectorRoute` | `TELEPHONY_TX` | Route B proven on device |
+| `vadMode` | `GEMINI_VAD` | server-side VAD, user decision ("optimisation later") |
+| `HALF_DUPLEX` | `true` | caller audio NOT sent while model speaks + `activityHandling=NO_INTERRUPTION`; kills echo-triggered barge-in. Cost: no barge-in |
+| `WATCHDOG_FATAL` | `false` | 8 s response watchdog logs instead of hanging up (a stalled turn killed a live call at 15:02) |
+| `HEALTH_DEMO` | `true` | `HealthPromptBn` + tool; `false` = original farming prompt, no tool |
+| `ANSWER_UNREGISTERED_CALLERS` | `true` | answer everyone |
+
+Gemini VAD tuning in `WireMessages.AutomaticActivityDetection`: start sensitivity HIGH, end HIGH, prefix 300 ms, silence 600 ms.
+
+Setup timeout raised 10→20 s (`GeminiLiveSession.setupTimeoutMs`) for slow venue Wi-Fi.
+
+## Live-call log (what each attempt taught us)
+
+| Time | Result | Cause / lesson |
+|---|---|---|
+| 14:04 | Tone test: 1 kHz heard on far phone | **Route B works.** Capture returns real 8 kHz audio |
+| 14:30 | Setup timeout 10 s | **Mobile data is suspended during a GSM call on this phone** (no VoLTE/IMS). Wi-Fi is mandatory during calls |
+| 14:35 | DNS fail instantly | Hotspot phone was the *calling* phone; it lost data when it dialled. Call from a different phone than the hotspot |
+| 14:37 | **First working conversation**, RTT 0.4–1.3 s | Local VAD barge-in too trigger-happy: every "জী/হ্যাঁ" restarted the greeting |
+| 14:38, 14:54 | Setup timeout | Flaky hotspot / venue guest Wi-Fi (500–1200 ms pings). Network, not code |
+| 14:57 | Greeting "কেমন আছেন?" cut at 640 ms, then silence | Gemini VAD saw `Interrupted` = echo of our own audio on the downlink. → HALF_DUPLEX |
+| 15:01 | Full greeting heard, then watchdog killed the call after 8 s | Model turn stalled (or never got an end-of-speech); watchdog was fatal. → `WATCHDOG_FATAL=false`, VAD start sensitivity back to HIGH |
+| 15:03+ | **untested** — current build | Next call decides |
+
+## Debugging playbook (phone attached over USB)
+
+```
+# arm before the call; prints bridge/gemini/summarizer lines after it ends
+adb logcat -c; adb logcat -s BridgeSession GeminiLiveSession ProfileSummarizer TelephonyTxInjector VoiceCallCapture
+# transcript of latest call
+adb exec-out cat /data/data/bd.callbridge/databases/callbridge.db{,-wal,-shm} > … ; sqlite3: select * from turns where callId=(select max(id) from calls)
+# debug hooks (debug build only, component target REQUIRED)
+adb shell am broadcast -n bd.callbridge/.debug.DebugInjectReceiver -a bd.callbridge.DEBUG_INJECT --es route TELEPHONY_TX --ei seconds 5
+adb shell am broadcast -n bd.callbridge/.debug.DebugInjectReceiver -a bd.callbridge.DEBUG_CAPTURE --ei seconds 5
+adb shell am broadcast -n bd.callbridge/.debug.DebugInjectReceiver -a bd.callbridge.DEBUG_SEED_CALL --es number 01700000099
+adb shell am broadcast -n bd.callbridge/.debug.DebugInjectReceiver -a bd.callbridge.DEBUG_SUMMARIZE
+```
+Bisection so far: TTS→injection ✅, capture ✅, STT ✅ (14:37 transcripts), network ✅ when on a good hotspot, **turn-taking ❌ (open)**. Key log lines: `phase=ACTIVE` (socket up), `server Interrupted` (VAD thought caller spoke), `round-trip caller-SpeechEnded -> first model audio`, `Watchdog: … non-fatal`.
+
+If half-duplex still stalls: check whether Gemini ever emits a caller transcript row (`role=CALLER` in `turns`) — if not, caller audio isn't crossing the VAD threshold: try `startOfSpeechSensitivity=HIGH` + `silenceDurationMs=400`, or fall back to `vadMode=LOCAL_VAD` with a min-speech-duration guard before barge-in (not yet implemented).
+
+## Milestones
+
+| | State |
 |---|---|
-| M0 dialer | **Done, verified on the phone.** Priv-app installs, all 5 priv perms granted, default dialer set, inbound call auto-answered and held ACTIVE. Demo flag `Config.ANSWER_UNREGISTERED_CALLERS=true` answers every caller (flip false for the shop pilot to restore reject→callback). |
-| M1a capture | Code-complete + Opus-reviewed + fixes applied, merged to main. Untested on device (needs a real call to confirm VOICE_DOWNLINK returns clean caller audio). |
-| M1b injection | **Merged to main.** Routes B (Telephony Tx, primary) + C (loopback) built and green; Route A (INCALL_MUSIC) confirmed impossible from an app. Untested on device. Route A2 (call-redirection) was never committed and is lost — not built. |
-| M2 Gemini bridge | **Merged to main.** Live handshake against real API succeeded; Opus review + fixes applied (hangup phrase, two-watchdog timing, event ordering, socket lifecycle); 34 unit tests green. Not yet wired into a call (that's M3). |
-| M3 wire-up | Not started. Compose capture → Gemini → injector into the active call; barge-in, greeting clip, watchdog, transcripts, status wiring. |
-| M4 shop pilot | Not started. |
+| M0 dialer | Done, verified |
+| M1a capture | Done, verified on device |
+| M1b injection | **Done, Route B verified on device** (`docs/injection-routes.md`) |
+| M2 Gemini | Done, live-verified incl. greeting text turn + tool call round trip |
+| M3 wire-up | Done, Opus-reviewed twice; all round-1 findings fixed; round-2 profile findings fixed. **Not fixed:** N2 `suppressStaleAudio` latch risk (moot under HALF_DUPLEX), m3 foreground service never stopped, n6/n8/n9 minors |
+| Health demo | Prompt + tool wired (unit-tested; tool round trip verified live via raw socket, NOT yet through `GeminiLiveSession` on a real call) |
+| Patient profile | Done; real migration 1→2; summarizer live-verified; Patients screen works (seeded + real call) |
+| M4 pilot | Parked; demo first |
 
-## Git / branch state
+## Network facts (critical for any live run)
 
-- `main` @ `6868968`, **pushed to origin** (github.com/ishmum123/callbridge, public). Contains M0 + M1a + M1b (Routes B/C) + M2, all merged. `origin/main` in sync.
-- All feature worktrees and branches (`audio-pipeline`, `gemini-session`, `injector-ndk`) are merged, removed, and deleted. Full integrated build is green (`testDebugUnitTest assembleDebug lint`).
-- Standing grant recorded: **always push `origin main` on a green state** (no per-push ask) for this repo.
+- Phone: SM-G781B, LineageOS 23.2 / Android 16, Robi SIM, **GSM voice → mobile data suspended during calls**. Wi-Fi required.
+- Good: Pixel hotspot (`Pixel_3809`) when the hotspot phone is NOT the caller. Bad: venue `BYLC-GUEST` (0.5–1.2 s RTT).
+- After any reboot: `adb root && adb remount && adb shell stop && adb shell start` (priv-app overlay is lost). Debug APK via `adb install -r` keeps the priv perms once granted.
 
-### Merge state
-The two fix branches from the prior session are recovered and merged: M2 fixes were uncommitted working-tree changes (found, finished, committed, green); M1b was already committed at its M1b tip (green after rebase). `docs/STATUS.md` conflict on the injector merge was resolved by keeping all milestone rows. Nothing left to merge; next is M3 wiring + on-device verification.
+## Keys / secrets
 
-## Injection — the make-or-break path (read `docs/injection-routes.md`)
+`local.properties` (gitignored): `GEMINI_API_KEY`, `OPENAI_API_KEY`, `EXA_API_KEY` → baked into `BuildConfig` of the debug APK. All three were pasted in chat: **rotate after the demo.**
 
-**Committed route priority (in code):** **B (telephony-tx preferred device) → A (incall-music, always unavailable) → C (physical loopback fallback)**, per `docs/injection-routes.md`. This is what ships in `main` today.
+## Immediate next steps
 
-**Route A2 (call-redirection) — an unimplemented idea, code lost.** The prior session's notes proposed routing an AudioTrack flagged `AudioAttributes.FLAG_CALL_REDIRECTION` (`1<<16`, not settable via public `Builder.setFlags()`, needs reflection/HiddenApiBypass) to the call TX path via the `CALL_AUDIO_INTERCEPTION` permission (`signature|privileged|role` — reportedly holdable by our priv-app via the allowlist's `privileged` component, unverified). The described `CallRedirectionInjector` + allowlist/manifest edits were **never committed and are unrecoverable**. If A2 is still wanted, it must be rewritten from scratch as a new injector route; treat the notes above as a starting hypothesis, not tested code.
-
-**On-device injection verification (the milestone-deciding test, nobody has run it yet):**
-1. Install the priv-app build (`scripts/install-privapp.sh`), reboot, re-remount, confirm `MODIFY_AUDIO_ROUTING` granted: `adb shell dumpsys package bd.callbridge | grep MODIFY_AUDIO_ROUTING`.
-2. During a live call, set `Config.injectorRoute = TELEPHONY_TX` and play the 1 kHz test tone via Route B; **the real success signal is `getRoutedDevice()?.type == TYPE_TELEPHONY`** AND the tone audible on the far phone. Do NOT trust `setPreferredDevice`/probe "success" alone — it can report true on a silent fallback to earpiece; the `RouteProbe` in `TelephonyTxInjector` exposes `routedDeviceId` for this.
-3. If B fails on device, fall back to C (padded box + speaker + second device), and/or reconsider building A2 fresh.
-
-## Device facts (phone: SM-G781B / r8q)
-
-- **LineageOS 23.2, Android 16, SDK 36** (NOT One UI — spec assumed One UI 13). Root via LineageOS "Rooted debugging": `adb root` → uid 0; `adb remount` → /system overlayfs rw.
-- **Reboot loses the /system overlay** (files survive in /cache but aren't remounted). After every reboot: `adb root && adb remount && adb shell stop && adb shell start`. The debug APK also installs cleanly as a normal app via `adb install -r` for iteration; priv-app placement is only needed for the signature|privileged perms.
-- **Phone must be unlocked (RUNNING_UNLOCKED)** before any app launches — remove the lock screen on the pilot device for unattended running.
-- SIM: Robi, LTE. HAL confirms `voice_tx` (flag-free) and `incall_music_uplink` mixPorts route to `Telephony Tx`; both incall-rec uplink/downlink capture paths exist.
-
-## Toolchain (this Mac)
-
-Android SDK 34–36, NDK 27.3.13750724, cmake 3.22, JDK 23, `adb`, Gradle 8.14.3 wrapper committed. `gradle` CLI is Homebrew 9.7.1 and CANNOT evaluate this project (AGP 8.13) — always use `./gradlew`. `local.properties` (gitignored) holds `sdk.dir` + `GEMINI_API_KEY`; each worktree needs its own copy.
-
-## Gemini (read `docs/gemini-live.md`)
-
-- Model `gemini-3.1-flash-live-preview` (fallback `gemini-2.5-flash-native-audio-preview-12-2025`), voice **Sulafat**, language **bn-IN** (user decisions — settled). Live handshake confirmed against the real API with the provided key.
-- **Server sends BINARY WebSocket frames** — a text-only onMessage silently receives nothing. Keep both overloads.
-- Fix worker was addressing 3 blockers: (1) `[HANGUP]` bracket token can't survive an audio-only speech round-trip → replaced with a spoken Bangla closing phrase matched in the transcript; (2) watchdog was firing on caller silence → re-armed only while a model reply is outstanding; (3) events emitted before subscription were dropped. Plus socket-lifecycle (onClosing/onFailure/goAway), send backpressure, leak fixes, prompt tweaks.
-
-## API key exposure
-
-`GEMINI_API_KEY` was pasted in chat and is baked into the debug APK via BuildConfig — decompilable. Rotate it in AI Studio after the hackathon.
-
-## Immediate next steps (in order)
-
-1. **Verify injection on device (Route B)** — the milestone-deciding test (grant check → live tone → far-phone audible + `routedDevice.type == TYPE_TELEPHONY`). This is the top priority; the whole product depends on injection working. If B fails, fall back to C and/or rebuild A2 fresh (it is not in the codebase).
-2. M3: wire capture → Gemini → injector into the active call; run the first end-to-end Bangla conversation; measure round-trip (<1.5 s target).
-3. (Optional) Re-implement Route A2 (call-redirection) as a new injector if Route B proves inadequate — the prior code was lost; see Injection above for the hypothesis.
-
-_Merge/recovery of the prior session's fix branches is DONE (see Merge state above); main is green and pushed._
+1. Test call on the 15:03 build (half-duplex + non-fatal watchdog). Read logs per playbook.
+2. If turn-taking works: run the demo script — health question → tool call → non-health question (refusal) → goodbye ("আল্লাহ হাফেজ, ভালো থাকবেন।" triggers hangup) → open Status → Patients.
+3. After demo: restore barge-in properly (LOCAL_VAD with min-speech guard, or echo suppression), make watchdog fatal again with the "line problem" clip (`res/raw/line_problem_24k.wav`, already committed, not yet played anywhere), stop the foreground service per call, rotate keys, update `docs/STATUS.md` health/tool sections (tool-wire worker skipped docs under deadline).
