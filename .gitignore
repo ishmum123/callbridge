@@ -29,3 +29,4 @@ CMakeFiles/
 .env
 secrets.properties
 .worktrees/
+.claude/worktrees/
