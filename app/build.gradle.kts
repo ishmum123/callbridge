@@ -34,6 +34,18 @@ android {
             "GEMINI_API_KEY",
             "\"${localProperties.getProperty("GEMINI_API_KEY", "")}\""
         )
+        // Health-knowledge tool providers (see knowledge/ package): missing key -> empty string
+        // -> that provider is disabled in CompositeHealthKnowledge.fromKeys.
+        buildConfigField(
+            "String",
+            "EXA_API_KEY",
+            "\"${localProperties.getProperty("EXA_API_KEY", "")}\""
+        )
+        buildConfigField(
+            "String",
+            "OPENAI_API_KEY",
+            "\"${localProperties.getProperty("OPENAI_API_KEY", "")}\""
+        )
 
         ksp {
             arg("room.schemaLocation", "$projectDir/schemas")
