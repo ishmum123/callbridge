@@ -72,7 +72,7 @@ class GeminiLiveSession(
     private val scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Default),
     private val watchdogTimeoutMs: Long = 8_000L,
     private val socketDeadTimeoutMs: Long = 60_000L,
-    private val setupTimeoutMs: Long = 10_000L,
+    private val setupTimeoutMs: Long = 20_000L,
     private val nowMs: () -> Long = System::currentTimeMillis,
     private val wsUrlBase: String =
         "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent",
