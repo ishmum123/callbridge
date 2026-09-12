@@ -9,7 +9,7 @@ Last updated: 2026-09-12 (M0 scaffold commit).
 | Milestone | Status |
 |---|---|
 | M0 — Dialer skeleton | Code-complete, unit-tested. **Untested on a real device** (no phone attached during this build). |
-| M1a — Capture | Pending. Interfaces (`AudioCapture`) and package (`audio/`) exist; no implementation. |
+| M1a — Capture | Code-complete, unit-tested (resampler THD/SNR, chunk-boundary continuity, VAD timing, mono→stereo). **Untested on a real device** — `AudioSource.VOICE_DOWNLINK`/`VOICE_CALL` need the priv-app install to actually initialize (`CAPTURE_AUDIO_OUTPUT`). |
 | M1b — Injection | Pending. `Injector` interface + `NoopInjector` + NDK/CMake toolchain proven (stub `nativeVersion()` JNI call); no real Route A/B/C implementation. |
 | M2 — Bridge | Pending. `LiveSession` interface + `UnimplementedLiveSession` stub exist; no OkHttp WebSocket client. |
 | M3 — Polish | Pending. |
@@ -31,10 +31,14 @@ Last updated: 2026-09-12 (M0 scaffold commit).
 
 All three packages contain doc comments pointing at the exact file/interface to implement; summarized here for quick orientation.
 
-### Audio-pipeline worker (M1a capture + resampling/VAD)
-- Implement `bd.callbridge.audio.AudioCapture` (file: `app/src/main/java/bd/callbridge/audio/AudioCapture.kt`) with a concrete `AudioRecord(VOICE_CALL, 8000, ...)` capture class, resampled to 16 kHz (`Config.CAPTURE_SAMPLE_RATE_HZ`), emitting `Flow<ShortArray>`.
-- Add VAD gating (WebRTC VAD mode 2, spec §4.2) as a decorator, kept separately testable (round-trip a sine, check THD; VAD gate timing — spec §8).
-- Needs `CAPTURE_AUDIO_OUTPUT` — priv-app only, i.e. must run through the Magisk-installed build.
+### Audio-pipeline worker (M1a capture + resampling/VAD) — DONE (this build, code review pending)
+- `VoiceCallCapture` (`audio/VoiceCallCapture.kt`) implements `AudioCapture`: `AudioRecord` at 8 kHz mono PCM16, tries `AudioSource.VOICE_DOWNLINK` first (per `docs/hal-recon.md`'s confirmed downlink-only usecase) then falls back to `VOICE_CALL`; read loop on a dedicated `Thread`; resamples to `Config.CAPTURE_SAMPLE_RATE_HZ` (16 kHz) before emitting on `frames`. Handles `AudioRecord` init failure (both sources) by logging and leaving `isCapturing == false`, never crashes. `start()`/`stop()` are idempotent.
+- `CaptureWavDumper` (`audio/CaptureWavDumper.kt`): optional raw 8 kHz PCM WAV dump to `filesDir/captures/<timestamp>.wav` — the M1a "listen to it" deliverable. Pass an instance into `VoiceCallCapture`'s constructor to enable; not wired in by default.
+- `Resampler` (`audio/Resampler.kt`): pure-Kotlin, stateful, windowed-sinc (Hann) fixed-ratio resampler, `Resampler(inRate, outRate).process(ShortArray): ShortArray`. Handles 8→16 kHz (capture) and 24→8/16 kHz (Gemini output → injector). `Resampler.monoToStereo()` companion helper for injector paths needing stereo (hal-recon.md). Has an inherent ~`halfWidth` (default 32) input-sample lookahead latency — negligible at 100 ms chunk sizes, but means the very last ~32/inRate seconds of a stream won't flush without extra trailing samples; harmless for a continuous call stream.
+- `VadGate` (`audio/VadGate.kt`): pure-Kotlin energy/RMS gate (not a WebRTC VAD port — simpler and sufficient; swappable behind the same API later if needed), 20 ms frames (320 samples @ 16 kHz), 200 ms pre-roll ring buffer, 400 ms hold after speech ends, `SpeechStarted`/`SpeechEnded` events for barge-in.
+- `AudioPipeline` (`audio/AudioPipeline.kt`): composes `capture.frames` → 20 ms re-framing → `VadGate` → 100 ms (1600-sample) `Flow<ShortArray>` chunks (spec §4.4 send size) on `.chunks`, plus `.vadEvents: SharedFlow<VadGate.Event>`. This is what phase 3 hands to `LiveSession`.
+- Unit tests: `app/src/test/java/bd/callbridge/audio/ResamplerTest.kt` (THD/SNR bound via best-lag cross-correlation, length ratio, chunk-boundary continuity via irregular-chunk streaming vs. one big call, mono→stereo, a 16→24→16 kHz round trip) and `VadGateTest.kt` (silence→tone→silence timing, pure-silence no-op, frame-size validation). All pass; `./gradlew assembleDebug`/`test`/`lint` green.
+- Still needs `CAPTURE_AUDIO_OUTPUT` — priv-app only, i.e. must run through the priv-app install (`scripts/install-privapp.sh`) to actually initialize on-device; untested on the real phone (no device access from this worker).
 
 ### Injector/NDK worker (M1b injection — the gating problem, spec §4.3)
 - `app/src/main/cpp/native.cpp` / `CMakeLists.txt`: currently a stub exposing `nativeVersion()`. Add the real native `AudioTrack` opened with `AUDIO_OUTPUT_FLAG_INCALL_MUSIC` (Route A), linked via `dlsym` against `libaudioclient.so`, with `open/write/flush/close` JNI methods on `bd.callbridge.audio.NativeBridge`.
