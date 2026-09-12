@@ -135,14 +135,22 @@ there is currently no app-level way to get the HAL to actually *open* the `incal
 use case in the first place — this switch alone is unlikely to change anything for Route B/C,
 but costs nothing to try and is explicitly requested by spec §4.3 step 3.
 
-## Working-state log (fill in during on-device M1b testing)
+## Working-state log (on-device M1b testing, 2026-09-12)
 
-_Not yet run on-device as of this commit — no phone attached during this worker's session.
-Orchestrator/device worker: fill in the table below after the on-device test pass._
+**Route B is PROVEN on device.** Live GSM call (Robi LTE, SM-G781B, LineageOS 23.2), debug build
+installed via `adb install -r` over the priv-app copy (priv perms retained). Trigger used:
+
+```
+adb shell am broadcast -n bd.callbridge/.debug.DebugInjectReceiver -a bd.callbridge.DEBUG_INJECT --es route TELEPHONY_TX --ei seconds 6
+adb shell am broadcast -n bd.callbridge/.debug.DebugInjectReceiver -a bd.callbridge.DEBUG_CAPTURE --ei seconds 5
+```
+(The `-n` component target is REQUIRED — an implicit `-a`-only broadcast is dropped by background
+broadcast limits and produces no log at all.)
 
 | Route | Result | Device/probe detail | Notes |
 |---|---|---|---|
-| B (Telephony Tx) | _pending_ | | |
-| A (Incall music) | _pending (expected: unavailable)_ | | |
-| C (Loopback) | _pending_ | | |
-| Mixer controls | _pending_ | | Values of `Incall_Music*` before/after toggle |
+| B (Telephony Tx) | **WORKS** — 1 kHz tone heard on the far phone by the operator | `deviceFound=true preferredDeviceSet=true routedDeviceId=13`, `getRoutedDevice()` = `TYPE_TELEPHONY(18)` product `SM-G781B`, before, ~300 ms into, and at end of playback | No mixer toggling needed. `getRoutedDevice()` also reports TYPE_TELEPHONY outside a call, so that check alone is not proof — far-phone audibility is. |
+| A (Incall music) | unavailable (by design) | | |
+| C (Loopback) | not run (B works) | | |
+| Mixer controls | not needed | | |
+| Capture (`VoiceCallCapture`, VOICE_DOWNLINK) | returns audio | 8 kHz mono, 5 s, `nonzero=true`, first ~1 s rms≈1800 then near-digital-silence (rms<5) while caller was quiet | GSM downlink silence is genuinely ~0 — VAD noise floor will sit very low. End-to-end voice quality still to be confirmed in M3. |
