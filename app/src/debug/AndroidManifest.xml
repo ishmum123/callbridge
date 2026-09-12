@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- Debug-only test hook (not merged into release builds): lets an operator trigger a
+         live injection or capture test from adb during a call. See
+         bd.callbridge.debug.DebugInjectReceiver for the handler and docs/injection-routes.md
+         for the test procedure. exported=true is required for `adb shell am broadcast` (running
+         as shell, not this app's uid) to reach it; scope is limited to debug builds via this
+         debug-sourceset-only manifest. -->
+    <application>
+        <receiver
+            android:name="bd.callbridge.debug.DebugInjectReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="bd.callbridge.DEBUG_INJECT" />
+                <action android:name="bd.callbridge.DEBUG_CAPTURE" />
+            </intent-filter>
+        </receiver>
+    </application>
+
+</manifest>
