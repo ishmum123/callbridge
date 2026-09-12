@@ -17,8 +17,10 @@ import java.util.Properties
 import java.util.concurrent.TimeUnit
 
 /**
- * Live smoke test against the real Gemini Live API. Skipped automatically when no
- * `GEMINI_API_KEY` is present in `local.properties` (e.g. CI without the secret).
+ * Live smoke test against the real Gemini Live API. Skipped unless BOTH:
+ *  - the `liveSmoke` system property is `"true"` (set via `-PliveSmoke=true`, see
+ *    `docs/gemini-live.md` for the exact command), so a plain `./gradlew test` never dials out, and
+ *  - `GEMINI_API_KEY` is present in `local.properties`.
  *
  * Opens a real session with the pinned model, sends 1s of silence, asserts no [LiveSessionEvent.Error]
  * arrives within 10s of setup completing, then closes cleanly. If the pinned model is rejected at
@@ -35,6 +37,10 @@ class GeminiLiveSmokeTest {
 
     @Test
     fun `real session opens, acks setup, and accepts silence without error`() = runBlocking {
+        assumeTrue(
+            "liveSmoke system property not set to true; skipping (see docs/gemini-live.md for the -PliveSmoke=true command)",
+            System.getProperty("liveSmoke") == "true",
+        )
         val apiKey = readApiKey()
         assumeTrue("GEMINI_API_KEY not present in local.properties; skipping live smoke test", apiKey != null)
 
@@ -59,14 +65,15 @@ class GeminiLiveSmokeTest {
             client = client,
             scope = CoroutineScope(SupervisorJob() + Dispatchers.Default),
             setupTimeoutMs = 10_000L,
-            // The smoke test deliberately sends only silence, which a real session may not
-            // respond to at all; use a longer watchdog than the 8s production default so the
-            // watchdog itself (already covered by MockWebServer tests) doesn't fire mid-assertion.
-            watchdogTimeoutMs = 30_000L,
+            // Production default (8s). Sending only silence with LOCAL_VAD and no
+            // sendActivityStart/End calls never arms the response watchdog (it's only outstanding
+            // between sendActivityEnd and turnComplete/interrupted) — the old 30s override here
+            // was a workaround for a since-fixed bug where the watchdog ran unconditionally.
         )
 
         val profile = CallerProfile(number = "01700000000", name = "টেস্ট", village = "টেস্ট গ্রাম", occupation = "কৃষক")
         val summaries = mutableListOf<String>()
+        // Subscribe before open(), per LiveSession.open's documented contract.
         val collectJob = launch {
             session.events.collect { ev ->
                 summaries.add(ev.javaClass.simpleName + (if (ev is LiveSessionEvent.Error) ": ${ev.message}" else ""))
@@ -82,10 +89,13 @@ class GeminiLiveSmokeTest {
 
             withTimeoutOrNull(10_000L) { delay(10_000L) }
 
-            val hadError = summaries.any { it.startsWith("Error") }
-            collectJob.cancel()
             session.close()
+            // Give the Closed event a moment to land before we stop collecting, so the printed
+            // summary reflects the full setupComplete -> ... -> Closed sequence.
+            withTimeoutOrNull(2_000L) { while (summaries.none { it.startsWith("Closed") }) delay(20) }
+            collectJob.cancel()
 
+            val hadError = summaries.any { it.startsWith("Error") }
             if (hadError) {
                 println("Model $modelId opened but reported an error: $summaries")
                 null

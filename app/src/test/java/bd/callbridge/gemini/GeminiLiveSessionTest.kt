@@ -89,6 +89,7 @@ class GeminiLiveSessionTest {
         harness: ServerHarness,
         vadMode: VadMode = VadMode.LOCAL_VAD,
         watchdogTimeoutMs: Long = 8_000L,
+        socketDeadTimeoutMs: Long = 60_000L,
     ): GeminiLiveSession {
         server.enqueue(MockResponse().withWebSocketUpgrade(harness.listener))
         return GeminiLiveSession(
@@ -97,6 +98,7 @@ class GeminiLiveSessionTest {
             client = client,
             scope = CoroutineScope(SupervisorJob() + Dispatchers.Default),
             watchdogTimeoutMs = watchdogTimeoutMs,
+            socketDeadTimeoutMs = socketDeadTimeoutMs,
             wsUrlBase = wsUrl(),
         )
     }
@@ -120,7 +122,7 @@ class GeminiLiveSessionTest {
         val speech = genConfig["speechConfig"]!!.jsonObject
         assertEquals("bn-IN", speech["languageCode"]!!.jsonPrimitive.content)
         assertEquals(
-            "Kore",
+            "Sulafat",
             speech["voiceConfig"]!!.jsonObject["prebuiltVoiceConfig"]!!.jsonObject["voiceName"]!!.jsonPrimitive.content,
         )
         assertTrue(setup["systemInstruction"]!!.jsonObject["parts"].toString().contains("SYSTEM PROMPT TEXT"))
@@ -245,10 +247,115 @@ class GeminiLiveSessionTest {
     }
 
     @Test
-    fun `watchdog emits Error after no inbound message for the timeout window`() = runBlocking {
+    fun `response watchdog does not fire on caller silence alone`() = runBlocking {
         val harness = ServerHarness()
-        // Short real timeout so the test doesn't need virtual time: exercises the same code path.
-        val session = newSession(harness, watchdogTimeoutMs = 300L)
+        // Short response-watchdog timeout, but no sendActivityEnd/response is ever outstanding,
+        // so plain silence (no caller speech, nothing sent) must never trip it.
+        val session = newSession(harness, watchdogTimeoutMs = 300L, socketDeadTimeoutMs = 60_000L)
+        val openJob = launch { session.open("p", profile) }
+        harness.awaitMessageCount(1)
+        harness.awaitSocket().send("""{"setupComplete":{}}""")
+        withTimeout(5_000) { openJob.join() }
+
+        val events = mutableListOf<LiveSessionEvent>()
+        val collectJob = launch { session.events.toList(events) }
+
+        delay(900) // several multiples of the 300ms response-watchdog window
+        assertTrue(events.none { it is LiveSessionEvent.Error })
+
+        collectJob.cancel()
+        session.close()
+    }
+
+    @Test
+    fun `response watchdog fires when a response is outstanding with no frames`() = runBlocking {
+        val harness = ServerHarness()
+        val session = newSession(harness, watchdogTimeoutMs = 300L, socketDeadTimeoutMs = 60_000L)
+        val openJob = launch { session.open("p", profile) }
+        harness.awaitMessageCount(1)
+        harness.awaitSocket().send("""{"setupComplete":{}}""")
+        withTimeout(5_000) { openJob.join() }
+
+        val events = mutableListOf<LiveSessionEvent>()
+        val collectJob = launch { session.events.toList(events) }
+
+        // Caller finished speaking: a response is now outstanding, but the server never answers.
+        session.sendActivityEnd()
+
+        withTimeout(5_000) {
+            while (events.none { it is LiveSessionEvent.Error }) delay(10)
+        }
+        assertTrue(events.any { it is LiveSessionEvent.Error && it.message.contains("outstanding") })
+        assertTrue(events.any { it is LiveSessionEvent.Closed })
+
+        collectJob.cancel()
+    }
+
+    @Test
+    fun `turnComplete disarms the response watchdog`() = runBlocking {
+        val harness = ServerHarness()
+        val session = newSession(harness, watchdogTimeoutMs = 300L, socketDeadTimeoutMs = 60_000L)
+        val openJob = launch { session.open("p", profile) }
+        harness.awaitMessageCount(1)
+        val serverWs = harness.awaitSocket()
+        serverWs.send("""{"setupComplete":{}}""")
+        withTimeout(5_000) { openJob.join() }
+
+        val events = mutableListOf<LiveSessionEvent>()
+        val collectJob = launch { session.events.toList(events) }
+
+        session.sendActivityEnd()
+        delay(100)
+        serverWs.send("""{"serverContent":{"turnComplete":true}}""")
+
+        withTimeout(5_000) {
+            while (events.none { it is LiveSessionEvent.TurnComplete }) delay(10)
+        }
+        delay(600) // outlast the 300ms watchdog window; it must not fire post-disarm
+        assertTrue(events.none { it is LiveSessionEvent.Error })
+
+        collectJob.cancel()
+        session.close()
+    }
+
+    @Test
+    fun `GeminiVad response watchdog arms on the first response frame after our audio`() = runBlocking {
+        val harness = ServerHarness()
+        val session = newSession(harness, vadMode = VadMode.GEMINI_VAD, watchdogTimeoutMs = 300L, socketDeadTimeoutMs = 60_000L)
+        val openJob = launch { session.open("p", profile) }
+        harness.awaitMessageCount(1)
+        val serverWs = harness.awaitSocket()
+        serverWs.send("""{"setupComplete":{}}""")
+        withTimeout(5_000) { openJob.join() }
+
+        val events = mutableListOf<LiveSessionEvent>()
+        val collectJob = launch { session.events.toList(events) }
+
+        session.sendAudio(ShortArray(160))
+        harness.awaitMessageCount(2)
+        delay(900) // no response yet: must not trip while GEMINI_VAD awaits the server's own VAD
+        assertTrue(events.none { it is LiveSessionEvent.Error })
+
+        val audioB64 = Base64.getEncoder().encodeToString(
+            GeminiLiveSession.shortsToLittleEndianBytes(shortArrayOf(1, 2, 3))
+        )
+        serverWs.send(
+            """{"serverContent":{"modelTurn":{"parts":[{"inlineData":{"mimeType":"audio/pcm;rate=24000","data":"$audioB64"}}]}}}"""
+        )
+
+        withTimeout(5_000) {
+            while (events.none { it is LiveSessionEvent.Error }) delay(10)
+        }
+        assertTrue(events.any { it is LiveSessionEvent.Error && it.message.contains("outstanding") })
+
+        collectJob.cancel()
+    }
+
+    @Test
+    fun `dead-socket guard fires when no frames arrive at all`() = runBlocking {
+        val harness = ServerHarness()
+        // Large response-watchdog window (never outstanding anyway) but a short dead-socket guard.
+        val session = newSession(harness, watchdogTimeoutMs = 60_000L, socketDeadTimeoutMs = 300L)
         val openJob = launch { session.open("p", profile) }
         harness.awaitMessageCount(1)
         harness.awaitSocket().send("""{"setupComplete":{}}""")
@@ -267,25 +374,48 @@ class GeminiLiveSessionTest {
     }
 
     @Test
-    fun `watchdog does not fire while messages keep arriving`() = runBlocking {
+    fun `setupComplete is emitted as an event, not just used internally`() = runBlocking {
         val harness = ServerHarness()
-        val session = newSession(harness, watchdogTimeoutMs = 300L)
-        val openJob = launch { session.open("p", profile) }
-        harness.awaitMessageCount(1)
-        val serverWs = harness.awaitSocket()
-        serverWs.send("""{"setupComplete":{}}""")
-        withTimeout(5_000) { openJob.join() }
-
+        server.enqueue(MockResponse().withWebSocketUpgrade(harness.listener))
+        val session = GeminiLiveSession(
+            authProvider = ApiKeyAuth("test-key"),
+            client = client,
+            scope = CoroutineScope(SupervisorJob() + Dispatchers.Default),
+            wsUrlBase = wsUrl(),
+        )
         val events = mutableListOf<LiveSessionEvent>()
         val collectJob = launch { session.events.toList(events) }
 
-        repeat(5) {
-            delay(150)
-            serverWs.send("""{"serverContent":{"turnComplete":false}}""")
+        val openJob = launch { session.open("p", profile) }
+        harness.awaitMessageCount(1)
+        harness.awaitSocket().send("""{"setupComplete":{}}""")
+        withTimeout(5_000) { openJob.join() }
+
+        withTimeout(5_000) {
+            while (events.none { it is LiveSessionEvent.SetupComplete }) delay(10)
         }
 
-        assertTrue(events.none { it is LiveSessionEvent.Error })
         collectJob.cancel()
+        session.close()
+    }
+
+    @Test
+    fun `open() a second time throws IllegalStateException`() = runBlocking {
+        val harness = ServerHarness()
+        val session = newSession(harness)
+        val openJob = launch { session.open("p", profile) }
+        harness.awaitMessageCount(1)
+        harness.awaitSocket().send("""{"setupComplete":{}}""")
+        withTimeout(5_000) { openJob.join() }
+
+        var threw = false
+        try {
+            session.open("p", profile)
+        } catch (e: IllegalStateException) {
+            threw = true
+        }
+        assertTrue(threw)
+
         session.close()
     }
 }

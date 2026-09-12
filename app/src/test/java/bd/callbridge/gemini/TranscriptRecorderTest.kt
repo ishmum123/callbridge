@@ -61,7 +61,7 @@ class TranscriptRecorderTest {
     }
 
     @Test
-    fun `detects HANGUP token and strips it from the stored turn text`() = runTest {
+    fun `detects the hangup phrase with punctuation variation and keeps it in the stored turn text`() = runTest {
         val turnDao = FakeTurnDao()
         val callDao = FakeCallDao(newCall())
         val recorder = TranscriptRecorder(callId, turnDao, callDao, startedAtMs = 0L)
@@ -70,14 +70,54 @@ class TranscriptRecorderTest {
         val collectJob = launch { recorder.hangupRequested.collect { hungUp = true } }
         runCurrent()
 
-        recorder.handle(LiveSessionEvent.OutputTranscript("আচ্ছা, বিদায়। "))
-        recorder.handle(LiveSessionEvent.OutputTranscript(SystemPromptBuilder.HANGUP_TOKEN))
+        // ASR punctuation/whitespace may differ from the literal prompt string.
+        recorder.handle(LiveSessionEvent.OutputTranscript("আচ্ছা,   আল্লাহ হাফেজ ভালো থাকবেন !"))
         recorder.handle(LiveSessionEvent.TurnComplete)
         runCurrent()
 
         assertTrue(hungUp)
         val assistantTurn = turnDao.inserted.first { it.role == TurnRole.ASSISTANT }
-        assertEquals("আচ্ছা, বিদায়।", assistantTurn.text)
+        // The phrase is genuine spoken content, not a hidden marker, so it stays in the transcript.
+        assertEquals("আচ্ছা,   আল্লাহ হাফেজ ভালো থাকবেন !", assistantTurn.text)
+        collectJob.cancel()
+    }
+
+    @Test
+    fun `detects the hangup phrase when split across output transcript fragments`() = runTest {
+        val turnDao = FakeTurnDao()
+        val callDao = FakeCallDao(newCall())
+        val recorder = TranscriptRecorder(callId, turnDao, callDao, startedAtMs = 0L)
+
+        var hungUp = false
+        val collectJob = launch { recorder.hangupRequested.collect { hungUp = true } }
+        runCurrent()
+
+        val phrase = SystemPromptBuilder.HANGUP_PHRASE
+        val mid = phrase.length / 2
+        recorder.handle(LiveSessionEvent.OutputTranscript(phrase.substring(0, mid)))
+        assertTrue(!hungUp)
+        recorder.handle(LiveSessionEvent.OutputTranscript(phrase.substring(mid)))
+        runCurrent()
+
+        assertTrue(hungUp)
+        collectJob.cancel()
+    }
+
+    @Test
+    fun `does not false-positive on ordinary text`() = runTest {
+        val turnDao = FakeTurnDao()
+        val callDao = FakeCallDao(newCall())
+        val recorder = TranscriptRecorder(callId, turnDao, callDao, startedAtMs = 0L)
+
+        var hungUp = false
+        val collectJob = launch { recorder.hangupRequested.collect { hungUp = true } }
+        runCurrent()
+
+        recorder.handle(LiveSessionEvent.OutputTranscript("ধানের দাম আজকে ভালো, বাজারে গিয়ে দেখুন।"))
+        recorder.handle(LiveSessionEvent.TurnComplete)
+        runCurrent()
+
+        assertTrue(!hungUp)
         collectJob.cancel()
     }
 

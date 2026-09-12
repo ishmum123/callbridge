@@ -1,15 +1,21 @@
 package bd.callbridge.gemini
 
+import android.util.Log
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.encodeToString
@@ -27,6 +33,8 @@ import okhttp3.WebSocketListener
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.Base64
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 
 /**
@@ -37,6 +45,15 @@ import java.util.concurrent.atomic.AtomicLong
  * mutation here is confined to atomics / a thread-safe [MutableSharedFlow]; the watchdog runs as
  * a coroutine on [scope].
  *
+ * Single-use: [open] may be called at most once per instance (see [LiveSession.open]).
+ *
+ * Watchdog semantics (spec §4.4, see `docs/gemini-live.md` for the full rationale): the
+ * [watchdogTimeoutMs] guard is armed only while a model *response is outstanding* — from
+ * [sendActivityEnd] ([VadMode.LOCAL_VAD]) or the first response frame after our audio
+ * ([VadMode.GEMINI_VAD]) until `turnComplete`/`interrupted` — so caller silence never trips it.
+ * A separate, always-on [socketDeadTimeoutMs] guard catches a socket that stops producing any
+ * frames at all (including outside an outstanding response).
+ *
  * @param nowMs injection point for tests: pass a virtual clock (e.g. a `TestScope`'s scheduler
  *   `currentTime`) synced with [scope]'s dispatcher to drive the watchdog deterministically.
  */
@@ -44,11 +61,12 @@ class GeminiLiveSession(
     private val authProvider: AuthProvider,
     private val vadMode: VadMode = VadMode.LOCAL_VAD,
     private val modelId: String = bd.callbridge.Config.GEMINI_MODEL_ID,
-    private val voiceName: String = "Kore",
+    private val voiceName: String = "Sulafat",
     private val languageCode: String = "bn-IN",
-    private val client: OkHttpClient = OkHttpClient.Builder().build(),
+    private val client: OkHttpClient = defaultClient,
     private val scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Default),
     private val watchdogTimeoutMs: Long = 8_000L,
+    private val socketDeadTimeoutMs: Long = 60_000L,
     private val setupTimeoutMs: Long = 10_000L,
     private val nowMs: () -> Long = System::currentTimeMillis,
     private val wsUrlBase: String =
@@ -60,21 +78,50 @@ class GeminiLiveSession(
     private val _events = MutableSharedFlow<LiveSessionEvent>(
         replay = 0,
         extraBufferCapacity = 1024,
+        onBufferOverflow = BufferOverflow.DROP_OLDEST,
     )
     override val events: SharedFlow<LiveSessionEvent> = _events.asSharedFlow()
 
+    private val _terminalState = MutableStateFlow<SessionTerminalState>(SessionTerminalState.Open)
+    override val terminalState: StateFlow<SessionTerminalState> = _terminalState.asStateFlow()
+
+    private val droppedEventCount = AtomicLong(0)
+    private val droppedAudioChunks = AtomicLong(0)
+    override val droppedAudioChunkCount: Long get() = droppedAudioChunks.get()
+
     private var webSocket: WebSocket? = null
-    private var watchdogJob: Job? = null
+
+    // Dead-socket guard: a single long-lived, self-correcting loop watching lastAnyFrameAtMs.
+    // Safe to let it sleep for a stale duration and recheck on wake (it never fires on stale
+    // info, since it recomputes "remaining" before declaring failure) — unlike the response
+    // watchdog below, it never needs to react *immediately* to a state change.
+    private var deadSocketWatchdogJob: Job? = null
+    private val lastAnyFrameAtMs = AtomicLong(0)
+
+    // Response watchdog: only meaningful while responseOutstanding is true. Implemented as a
+    // single-shot job that's cancelled and relaunched on every arm/reset, rather than folded into
+    // the dead-socket loop above — a shared loop can be mid-sleep for the (much longer) dead-socket
+    // window when a response becomes outstanding, and wouldn't wake up in time to start counting.
+    @Volatile private var responseOutstanding = false
+    private var responseWatchdogJob: Job? = null
+
     private val setupComplete = CompletableDeferred<Unit>()
-    private val lastMessageAtMs = AtomicLong(0)
+    @Volatile private var opened = false
     @Volatile private var closed = false
 
+    // GEMINI_VAD only: whether we've sent audio since the last turn ended, used to detect "the
+    // first response frame after our audio" that arms the watchdog in that mode.
+    private val audioSentSinceTurn = AtomicBoolean(false)
+
     override suspend fun open(systemPrompt: String, profile: CallerProfile) {
+        check(!opened) { "GeminiLiveSession.open() called twice; sessions are single-use — open a new instance per call." }
+        opened = true
+
         val key = authProvider.token()
         val url = "$wsUrlBase?key=$key"
         val request = Request.Builder().url(url).build()
 
-        lastMessageAtMs.set(nowMs())
+        lastAnyFrameAtMs.set(nowMs())
         webSocket = client.newWebSocket(request, Listener())
 
         val setup = SetupEnvelope(
@@ -101,7 +148,9 @@ class GeminiLiveSession(
         try {
             withTimeout(setupTimeoutMs) { setupComplete.await() }
         } catch (e: Exception) {
-            _events.tryEmit(LiveSessionEvent.Error("Setup not acknowledged within ${setupTimeoutMs}ms", e))
+            val message = "Setup not acknowledged within ${setupTimeoutMs}ms"
+            markTerminal(SessionTerminalState.Failed(message, e))
+            emitChecked(LiveSessionEvent.Error(message, e))
             throw e
         }
 
@@ -109,6 +158,12 @@ class GeminiLiveSession(
     }
 
     override fun sendAudio(pcm: ShortArray) {
+        val ws = webSocket
+        if (ws != null && ws.queueSize() > AUDIO_QUEUE_BACKPRESSURE_BYTES) {
+            droppedAudioChunks.incrementAndGet()
+            return
+        }
+        if (vadMode == VadMode.GEMINI_VAD) audioSentSinceTurn.set(true)
         val bytes = shortsToLittleEndianBytes(pcm)
         val b64 = Base64.getEncoder().encodeToString(bytes)
         val envelope = RealtimeInputEnvelope(
@@ -124,6 +179,7 @@ class GeminiLiveSession(
 
     override fun sendActivityEnd() {
         if (vadMode != VadMode.LOCAL_VAD) return
+        armResponseWatchdog()
         send(json.encodeToString(RealtimeInputEnvelope(RealtimeInputPayload(activityEnd = JsonObject(emptyMap())))))
     }
 
@@ -139,26 +195,71 @@ class GeminiLiveSession(
     override suspend fun close() {
         if (closed) return
         closed = true
-        watchdogJob?.cancel()
+        deadSocketWatchdogJob?.cancel()
+        responseWatchdogJob?.cancel()
         webSocket?.close(1000, "client close")
         webSocket = null
-        _events.tryEmit(LiveSessionEvent.Closed)
+        markTerminal(SessionTerminalState.Closed)
+        emitChecked(LiveSessionEvent.Closed)
+        scope.cancel()
     }
 
     private fun send(text: String) {
         val ws = webSocket ?: return
         if (!ws.send(text)) {
-            _events.tryEmit(LiveSessionEvent.Error("WebSocket send buffer full or socket closed"))
+            emitChecked(LiveSessionEvent.Error("WebSocket send buffer full or socket closed"))
         }
     }
 
+    /** Records a dropped event (buffer overflow) and, for terminal events, updates [terminalState]. */
+    private fun emitChecked(event: LiveSessionEvent) {
+        if (!_events.tryEmit(event)) {
+            droppedEventCount.incrementAndGet()
+            Log.w(TAG, "Dropped event, buffer full (total dropped=${droppedEventCount.get()}): $event")
+        }
+    }
+
+    /** Sets [terminalState] once; the first terminal state (usually a [SessionTerminalState.Failed]) wins. */
+    private fun markTerminal(state: SessionTerminalState) {
+        if (_terminalState.value is SessionTerminalState.Open) {
+            _terminalState.value = state
+        }
+    }
+
+    /** (Re)starts the single-shot response watchdog: fires if [watchdogTimeoutMs] elapses with no [noteResponseFrame]. */
+    private fun armResponseWatchdog() {
+        responseOutstanding = true
+        responseWatchdogJob?.cancel()
+        responseWatchdogJob = scope.launch {
+            delay(watchdogTimeoutMs)
+            val message = "Watchdog: model response outstanding with no frame for ${watchdogTimeoutMs}ms"
+            markTerminal(SessionTerminalState.Failed(message))
+            emitChecked(LiveSessionEvent.Error(message))
+            close()
+        }
+    }
+
+    private fun disarmResponseWatchdog() {
+        responseOutstanding = false
+        audioSentSinceTurn.set(false)
+        responseWatchdogJob?.cancel()
+        responseWatchdogJob = null
+    }
+
+    /** Resets the single-shot response watchdog's deadline; equivalent to a fresh [armResponseWatchdog]. */
+    private fun noteResponseFrame() {
+        armResponseWatchdog()
+    }
+
     private fun startWatchdog() {
-        watchdogJob = scope.launch {
+        deadSocketWatchdogJob = scope.launch {
             while (isActive) {
-                val elapsed = nowMs() - lastMessageAtMs.get()
-                val remaining = watchdogTimeoutMs - elapsed
+                val elapsed = nowMs() - lastAnyFrameAtMs.get()
+                val remaining = socketDeadTimeoutMs - elapsed
                 if (remaining <= 0) {
-                    _events.tryEmit(LiveSessionEvent.Error("Watchdog: no socket message for ${elapsed}ms"))
+                    val message = "Watchdog: no socket message at all for ${socketDeadTimeoutMs}ms"
+                    markTerminal(SessionTerminalState.Failed(message))
+                    emitChecked(LiveSessionEvent.Error(message))
                     close()
                     break
                 }
@@ -168,35 +269,49 @@ class GeminiLiveSession(
     }
 
     private fun onServerText(text: String) {
-        lastMessageAtMs.set(nowMs())
+        lastAnyFrameAtMs.set(nowMs())
         val obj = try {
             json.parseToJsonElement(text).jsonObject
         } catch (e: Exception) {
-            _events.tryEmit(LiveSessionEvent.Error("Malformed server message: ${e.message}", e))
+            emitChecked(LiveSessionEvent.Error("Malformed server message: ${e.message}", e))
             return
         }
 
         obj["setupComplete"]?.let {
             setupComplete.complete(Unit)
+            emitChecked(LiveSessionEvent.SetupComplete)
             return
         }
         obj["goAway"]?.let {
-            _events.tryEmit(LiveSessionEvent.Error("Server sent goAway; connection closing soon"))
+            val message = "Server sent goAway; connection closing soon"
+            markTerminal(SessionTerminalState.Failed(message))
+            emitChecked(LiveSessionEvent.Error(message))
+            // Drive one terminal signal ourselves rather than waiting for the server's own close,
+            // so callers see a deterministic Error -> Closed sequence.
+            scope.launch { close() }
             return
         }
         obj["serverContent"]?.jsonObject?.let { handleServerContent(it) }
     }
 
     private fun handleServerContent(sc: JsonObject) {
+        // GEMINI_VAD: the first response frame after our audio arms the watchdog (see class doc).
+        if (vadMode == VadMode.GEMINI_VAD && !responseOutstanding && audioSentSinceTurn.get()) {
+            armResponseWatchdog()
+        } else if (responseOutstanding) {
+            noteResponseFrame()
+        }
+
         if (sc["interrupted"]?.jsonPrimitive?.booleanOrNull == true) {
-            _events.tryEmit(LiveSessionEvent.Interrupted)
+            disarmResponseWatchdog()
+            emitChecked(LiveSessionEvent.Interrupted)
         }
 
         sc["inputTranscription"]?.jsonObject?.get("text")?.jsonPrimitive?.contentOrNull?.let {
-            if (it.isNotEmpty()) _events.tryEmit(LiveSessionEvent.InputTranscript(it))
+            if (it.isNotEmpty()) emitChecked(LiveSessionEvent.InputTranscript(it))
         }
         sc["outputTranscription"]?.jsonObject?.get("text")?.jsonPrimitive?.contentOrNull?.let {
-            if (it.isNotEmpty()) _events.tryEmit(LiveSessionEvent.OutputTranscript(it))
+            if (it.isNotEmpty()) emitChecked(LiveSessionEvent.OutputTranscript(it))
         }
 
         (sc["modelTurn"]?.jsonObject?.get("parts") as? kotlinx.serialization.json.JsonArray)?.forEach { partEl ->
@@ -206,11 +321,25 @@ class GeminiLiveSession(
             if (!mime.startsWith("audio/")) return@forEach
             val data = inline["data"]?.jsonPrimitive?.contentOrNull ?: return@forEach
             val bytes = Base64.getDecoder().decode(data)
-            _events.tryEmit(LiveSessionEvent.AudioOut(littleEndianBytesToShorts(bytes)))
+            val rate = mime.substringAfter("rate=", "").toIntOrNull()
+            if (rate != null && rate != EXPECTED_OUTPUT_SAMPLE_RATE_HZ) {
+                emitChecked(
+                    LiveSessionEvent.Error(
+                        "Unexpected output audio sample rate: ${rate}Hz (expected ${EXPECTED_OUTPUT_SAMPLE_RATE_HZ}Hz, mimeType=$mime)"
+                    )
+                )
+            }
+            emitChecked(
+                LiveSessionEvent.AudioOut(
+                    littleEndianBytesToShorts(bytes),
+                    sampleRate = rate ?: EXPECTED_OUTPUT_SAMPLE_RATE_HZ,
+                )
+            )
         }
 
         if (sc["turnComplete"]?.jsonPrimitive?.booleanOrNull == true) {
-            _events.tryEmit(LiveSessionEvent.TurnComplete)
+            disarmResponseWatchdog()
+            emitChecked(LiveSessionEvent.TurnComplete)
         }
     }
 
@@ -220,26 +349,67 @@ class GeminiLiveSession(
         }
 
         override fun onMessage(webSocket: WebSocket, bytes: okio.ByteString) {
-            // The Live API's WS protocol sends JSON text frames; binary frames aren't expected,
-            // but handle defensively by decoding as UTF-8 JSON.
+            // The real Gemini Live API sends every server message as a BINARY frame (opcode
+            // 0x2), never text (opcode 0x1) — verified against the live endpoint (see
+            // docs/gemini-live.md). This is the primary, required path, not a defensive fallback:
+            // an OkHttp client that only implements onMessage(String) receives nothing at all.
             onServerText(bytes.utf8())
         }
 
         override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-            lastMessageAtMs.set(nowMs())
-            _events.tryEmit(LiveSessionEvent.Error("WebSocket failure: ${t.message}", t))
+            if (closed) return
+            closed = true
+            deadSocketWatchdogJob?.cancel()
+            responseWatchdogJob?.cancel()
+            this@GeminiLiveSession.webSocket = null
+            val message = "WebSocket failure: ${t.message}"
+            markTerminal(SessionTerminalState.Failed(message, t))
+            emitChecked(LiveSessionEvent.Error(message, t))
+            emitChecked(LiveSessionEvent.Closed)
+            scope.cancel()
+        }
+
+        override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+            // Complete the close handshake so OkHttp finishes the socket and calls onClosed,
+            // which is where we actually emit LiveSessionEvent.Closed.
+            webSocket.close(code, reason)
         }
 
         override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
             if (!closed) {
                 closed = true
-                watchdogJob?.cancel()
-                _events.tryEmit(LiveSessionEvent.Closed)
+                deadSocketWatchdogJob?.cancel()
+                responseWatchdogJob?.cancel()
+                markTerminal(SessionTerminalState.Closed)
+                emitChecked(LiveSessionEvent.Closed)
+                scope.cancel()
             }
         }
     }
 
     companion object {
+        private const val TAG = "GeminiLiveSession"
+
+        /** Expected sample rate of Gemini's audio output; see [bd.callbridge.Config.GEMINI_OUTPUT_SAMPLE_RATE_HZ]. */
+        const val EXPECTED_OUTPUT_SAMPLE_RATE_HZ = bd.callbridge.Config.GEMINI_OUTPUT_SAMPLE_RATE_HZ
+
+        /**
+         * Backpressure threshold for [sendAudio]: ~2s of 16 kHz mono PCM16 (16_000 * 2 bytes/sample
+         * * 2s). Chunks are dropped rather than queued past this so a slow/degraded socket doesn't
+         * accumulate unbounded latency between caller speech and Gemini hearing it.
+         */
+        const val AUDIO_QUEUE_BACKPRESSURE_BYTES: Long = 16_000L * 2 * 2
+
+        /**
+         * Shared client for all [GeminiLiveSession] instances that don't pass their own: one
+         * connection pool/dispatcher instead of leaking a new one per call, plus a WebSocket
+         * ping every 20s so OkHttp itself detects a silently-dead socket (triggering `onFailure`)
+         * instead of relying solely on the application-level dead-socket watchdog.
+         */
+        val defaultClient: OkHttpClient by lazy {
+            OkHttpClient.Builder().pingInterval(20, TimeUnit.SECONDS).build()
+        }
+
         fun shortsToLittleEndianBytes(pcm: ShortArray): ByteArray {
             val buf = ByteBuffer.allocate(pcm.size * 2).order(ByteOrder.LITTLE_ENDIAN)
             pcm.forEach { buf.putShort(it) }

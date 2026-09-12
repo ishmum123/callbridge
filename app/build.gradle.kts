@@ -128,3 +128,11 @@ dependencies {
     androidTestImplementation(libs.androidx.test.ext.junit)
     androidTestImplementation(libs.espresso.core)
 }
+
+// GeminiLiveSmokeTest dials the real Gemini Live API and is gated behind the `liveSmoke` system
+// property so a plain `./gradlew test` / `./gradlew testDebugUnitTest` stays offline. Run it
+// explicitly with:
+//   ./gradlew testDebugUnitTest -PliveSmoke=true --tests "*GeminiLiveSmokeTest*"
+tasks.withType<Test>().configureEach {
+    systemProperty("liveSmoke", (project.findProperty("liveSmoke") ?: "false").toString())
+}

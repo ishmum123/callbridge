@@ -26,7 +26,7 @@ Setup message (client -> server, once, right after connecting):
     "generationConfig": {
       "responseModalities": ["AUDIO"],
       "speechConfig": {
-        "voiceConfig": {"prebuiltVoiceConfig": {"voiceName": "Kore"}},
+        "voiceConfig": {"prebuiltVoiceConfig": {"voiceName": "Sulafat"}},
         "languageCode": "bn-IN"
       }
     },

@@ -6,7 +6,7 @@ import org.junit.Test
 import java.time.LocalDate
 
 class SystemPromptBuilderTest {
-    private val template = "shop={shop} name={name} village={village} occ={occupation} date={date} token=[HANGUP]"
+    private val template = "shop={shop} name={name} village={village} occ={occupation} date={date} caller=[{caller_line}]"
 
     @Test
     fun `interpolates all placeholders`() {
@@ -18,22 +18,39 @@ class SystemPromptBuilderTest {
         assertTrue(result.contains("village=Dumuria"))
         assertTrue(result.contains("occ=কৃষক"))
         assertTrue(result.contains("date=12 September 2026"))
-        assertTrue(result.contains(SystemPromptBuilder.HANGUP_TOKEN))
     }
 
     @Test
-    fun `falls back to unknown for missing profile fields`() {
+    fun `falls back to unknown for missing per-field placeholders`() {
         val profile = CallerProfile(number = "017", name = null, village = null, occupation = null)
         val result = SystemPromptBuilder.interpolate(template, profile, "shop", LocalDate.of(2026, 1, 1))
 
-        assertEquals(
-            "shop=shop name=অজানা village=অজানা occ=অজানা date=1 January 2026 token=[HANGUP]",
-            result,
-        )
+        assertTrue(result.contains("name=অজানা"))
+        assertTrue(result.contains("village=অজানা"))
+        assertTrue(result.contains("occ=অজানা"))
+        assertTrue(result.contains("date=1 January 2026"))
     }
 
     @Test
-    fun `raw template file contains the hangup token and all placeholders`() {
+    fun `composes caller_line from only the known fields`() {
+        val profile = CallerProfile(number = "017", name = "Karim", village = null, occupation = "কৃষক")
+        val result = SystemPromptBuilder.interpolate(template, profile, "shop", LocalDate.of(2026, 1, 1))
+
+        assertTrue(result.contains("নাম Karim"))
+        assertTrue(result.contains("পেশা কৃষক"))
+        assertTrue(!result.contains("গ্রাম"))
+    }
+
+    @Test
+    fun `omits caller_line entirely when the profile is empty`() {
+        val profile = CallerProfile(number = "017", name = null, village = null, occupation = null)
+        val result = SystemPromptBuilder.interpolate(template, profile, "shop", LocalDate.of(2026, 1, 1))
+
+        assertEquals("caller=[]", result.substringAfter("date=1 January 2026 ").trim())
+    }
+
+    @Test
+    fun `raw template file contains the hangup phrase and all placeholders`() {
         val text = SystemPromptBuilderTest::class.java.classLoader
             ?.getResourceAsStream("raw/system_prompt_bn.txt")
             ?.bufferedReader(Charsets.UTF_8)?.readText()
@@ -43,11 +60,11 @@ class SystemPromptBuilderTest {
             "src/main/res/raw/system_prompt_bn.txt"
         ).readText(Charsets.UTF_8)
 
-        assertTrue(content.contains("{name}"))
-        assertTrue(content.contains("{village}"))
-        assertTrue(content.contains("{occupation}"))
+        assertTrue(content.contains("{caller_line}"))
         assertTrue(content.contains("{date}"))
         assertTrue(content.contains("{shop}"))
-        assertTrue(content.contains("[HANGUP]"))
+        assertTrue(content.contains(SystemPromptBuilder.HANGUP_PHRASE))
+        assertTrue(!content.contains("[HANGUP]"))
+        assertTrue(!content.contains("HANGUP"))
     }
 }
