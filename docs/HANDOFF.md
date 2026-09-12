@@ -1,43 +1,41 @@
-# CallBridge — session handoff (2026-09-12)
+# CallBridge — session handoff (2026-09-12, updated)
 
 Authoritative running state. Read this + `docs/STATUS.md` + `docs/injection-routes.md` + `docs/gemini-live.md` + `docs/hal-recon.md` + `docs/device-log.md` before continuing. Spec is `callbridge-spec.md`.
 
 ## Where we are
 
-Milestones M0, M1a, M1b (code), M2 (code) are built. Injection (the project's one hard problem) has a promising verified-feasible path but is **not yet proven on device** — that is the single most important open task.
+Milestones M0, M1a, M1b (code), M2 (code) are built **and all merged to `main`** (@ `6868968`, pushed). The M2 and M1b fix branches from the prior session are finished, green, and merged; their worktrees are removed. Injection (the project's one hard problem) is committed as **Route B (Telephony Tx) primary** and is **not yet proven on device** — that is the single most important open task.
+
+**Route A2 (call-redirection) was NOT recovered.** The prior session's notes described in-flight A2 work (a `CallRedirectionInjector` + `CALL_AUDIO_INTERCEPTION` permission), but it was never committed and is not in any branch, worktree, stash, or reflog — it is lost. What is committed is Route B/C + a researched-dead Route A (`IncallMusicInjector`). A2 remains an unimplemented idea; see Injection below.
 
 | Milestone | State |
 |---|---|
 | M0 dialer | **Done, verified on the phone.** Priv-app installs, all 5 priv perms granted, default dialer set, inbound call auto-answered and held ACTIVE. Demo flag `Config.ANSWER_UNREGISTERED_CALLERS=true` answers every caller (flip false for the shop pilot to restore reject→callback). |
 | M1a capture | Code-complete + Opus-reviewed + fixes applied, merged to main. Untested on device (needs a real call to confirm VOICE_DOWNLINK returns clean caller audio). |
-| M1b injection | Code on branch `injector-ndk`; Opus review done; **fix worker was mid-flight when the session closed** (see below). Routes B/C built; Route A (INCALL_MUSIC) confirmed impossible from an app; **Route A2 (call-redirection) is the new primary path** — see Injection. |
-| M2 Gemini bridge | Code on branch `gemini-session`; live handshake against real API succeeded; Opus review done; **fix worker was mid-flight when the session closed** (see below). |
+| M1b injection | **Merged to main.** Routes B (Telephony Tx, primary) + C (loopback) built and green; Route A (INCALL_MUSIC) confirmed impossible from an app. Untested on device. Route A2 (call-redirection) was never committed and is lost — not built. |
+| M2 Gemini bridge | **Merged to main.** Live handshake against real API succeeded; Opus review + fixes applied (hangup phrase, two-watchdog timing, event ordering, socket lifecycle); 34 unit tests green. Not yet wired into a call (that's M3). |
 | M3 wire-up | Not started. Compose capture → Gemini → injector into the active call; barge-in, greeting clip, watchdog, transcripts, status wiring. |
 | M4 shop pilot | Not started. |
 
 ## Git / branch state
 
-- `main` @ `e7edd17`, **pushed to origin** (github.com/ishmum123/callbridge, public). Contains M0 + M1a (merged) + callback fix + demo flag.
-- Worktrees under `.worktrees/`: `audio-pipeline` (merged, can be removed), `gemini-session`, `injector-ndk`.
-- **Two fix branches were being updated when the session closed.** Check `git -C .worktrees/gemini-session log --oneline` and `git -C .worktrees/injector-ndk log --oneline` for a WIP commit; if none, the fixes are uncommitted working-tree changes in those worktrees (`git -C .worktrees/<w> status`). Inspect, finish, or re-run the fix brief.
+- `main` @ `6868968`, **pushed to origin** (github.com/ishmum123/callbridge, public). Contains M0 + M1a + M1b (Routes B/C) + M2, all merged. `origin/main` in sync.
+- All feature worktrees and branches (`audio-pipeline`, `gemini-session`, `injector-ndk`) are merged, removed, and deleted. Full integrated build is green (`testDebugUnitTest assembleDebug lint`).
 - Standing grant recorded: **always push `origin main` on a green state** (no per-push ask) for this repo.
 
-### Merge order for next session
-1. Finish/verify the two fix branches build green (`./gradlew testDebugUnitTest assembleDebug lint` in each worktree).
-2. Rebase each onto `main` (both branched from the pre-callback-fix commit; expect a `docs/STATUS.md` text conflict only — resolve by keeping both milestone rows).
-3. Merge `gemini-session` then `injector-ndk` into main, push.
-4. Then M3 wiring.
+### Merge state
+The two fix branches from the prior session are recovered and merged: M2 fixes were uncommitted working-tree changes (found, finished, committed, green); M1b was already committed at its M1b tip (green after rebase). `docs/STATUS.md` conflict on the injector merge was resolved by keeping all milestone rows. Nothing left to merge; next is M3 wiring + on-device verification.
 
 ## Injection — the make-or-break path (read `docs/injection-routes.md`)
 
-Route priority is now: **A2 (call-redirection) → B (telephony-tx preferred device) → A (incall-music, unavailable) → C (physical loopback fallback)**.
+**Committed route priority (in code):** **B (telephony-tx preferred device) → A (incall-music, always unavailable) → C (physical loopback fallback)**, per `docs/injection-routes.md`. This is what ships in `main` today.
 
-**Route A2 (new, promising).** AOSP routes an AudioTrack flagged `AudioAttributes.FLAG_CALL_REDIRECTION` to the call's TX path if the app holds `CALL_AUDIO_INTERCEPTION`. **Verified on this phone: that permission is `signature|privileged|role`, so the `privileged` component lets our priv-app hold it via the allowlist** (no signature/role needed). The fix worker was adding the permission to `magisk/system/etc/permissions/privapp-permissions-callbridge.xml` + manifest and implementing `CallRedirectionInjector` (sets the hidden flag via reflection/HiddenApiBypass). The flag `FLAG_CALL_REDIRECTION = 1<<16` is NOT settable via public `Builder.setFlags()`.
+**Route A2 (call-redirection) — an unimplemented idea, code lost.** The prior session's notes proposed routing an AudioTrack flagged `AudioAttributes.FLAG_CALL_REDIRECTION` (`1<<16`, not settable via public `Builder.setFlags()`, needs reflection/HiddenApiBypass) to the call TX path via the `CALL_AUDIO_INTERCEPTION` permission (`signature|privileged|role` — reportedly holdable by our priv-app via the allowlist's `privileged` component, unverified). The described `CallRedirectionInjector` + allowlist/manifest edits were **never committed and are unrecoverable**. If A2 is still wanted, it must be rewritten from scratch as a new injector route; treat the notes above as a starting hypothesis, not tested code.
 
-**On-device verification still required (nobody has run this yet):**
-1. Reinstall with the new allowlist entry, reboot, confirm: `adb shell dumpsys package bd.callbridge | grep CALL_AUDIO_INTERCEPTION` shows `granted=true`.
-2. During a live call, play the 1 kHz test tone via the CallRedirection route; **the real success signal is `getRoutedDevice()?.type == TYPE_TELEPHONY`** AND the tone being audible on the far phone. Do NOT trust `setPreferredDevice`/probe "success" — it reports true even on silent fallback to earpiece (fixed in the probe rewrite).
-3. If A2 fails, try B, then fall back to C (padded box + USB dongle + second device).
+**On-device injection verification (the milestone-deciding test, nobody has run it yet):**
+1. Install the priv-app build (`scripts/install-privapp.sh`), reboot, re-remount, confirm `MODIFY_AUDIO_ROUTING` granted: `adb shell dumpsys package bd.callbridge | grep MODIFY_AUDIO_ROUTING`.
+2. During a live call, set `Config.injectorRoute = TELEPHONY_TX` and play the 1 kHz test tone via Route B; **the real success signal is `getRoutedDevice()?.type == TYPE_TELEPHONY`** AND the tone audible on the far phone. Do NOT trust `setPreferredDevice`/probe "success" alone — it can report true on a silent fallback to earpiece; the `RouteProbe` in `TelephonyTxInjector` exposes `routedDeviceId` for this.
+3. If B fails on device, fall back to C (padded box + speaker + second device), and/or reconsider building A2 fresh.
 
 ## Device facts (phone: SM-G781B / r8q)
 
@@ -62,7 +60,8 @@ Android SDK 34–36, NDK 27.3.13750724, cmake 3.22, JDK 23, `adb`, Gradle 8.14.3
 
 ## Immediate next steps (in order)
 
-1. Recover the two in-flight fix branches (WIP commit or working-tree changes in the worktrees), finish them, get each green.
-2. Rebase + merge `gemini-session` and `injector-ndk` into main; push.
-3. **Verify Route A2 on device** — the milestone-deciding test (grant check → live tone → far-phone audible + routedToTelephony). This is the top priority; the whole product depends on it.
-4. M3: wire capture → Gemini → injector into the active call; run the first end-to-end Bangla conversation; measure round-trip (<1.5 s target).
+1. **Verify injection on device (Route B)** — the milestone-deciding test (grant check → live tone → far-phone audible + `routedDevice.type == TYPE_TELEPHONY`). This is the top priority; the whole product depends on injection working. If B fails, fall back to C and/or rebuild A2 fresh (it is not in the codebase).
+2. M3: wire capture → Gemini → injector into the active call; run the first end-to-end Bangla conversation; measure round-trip (<1.5 s target).
+3. (Optional) Re-implement Route A2 (call-redirection) as a new injector if Route B proves inadequate — the prior code was lost; see Injection above for the hypothesis.
+
+_Merge/recovery of the prior session's fix branches is DONE (see Merge state above); main is green and pushed._
