@@ -2,7 +2,7 @@
 
 Rooted Android → Gemini Live PSTN gateway. Pilot for a rural AI helpline in Bangladesh.
 
-Start with [`callbridge-spec.md`](./callbridge-spec.md) — full architecture, components, priv-app install, and milestone build order (M0 → M4). M1b (audio injection into the call uplink) is the gating problem; everything else is standard Android plumbing.
+**Continuing this project? Read [`docs/HANDOFF.md`](./docs/HANDOFF.md) first.** Start with [`callbridge-spec.md`](./callbridge-spec.md) — full architecture, components, priv-app install, and milestone build order (M0 → M4). M1b (audio injection into the call uplink) is the gating problem; everything else is standard Android plumbing.
 
 See [`docs/STATUS.md`](./docs/STATUS.md) for current milestone status and handoff notes for the audio-pipeline, injector/NDK, and Gemini-session workers, and [`docs/hal-recon.md`](./docs/hal-recon.md) for the pilot phone's real audio-HAL layout (device is LineageOS 23.2 / Android 16, not the One UI 13 the spec assumed).
 
