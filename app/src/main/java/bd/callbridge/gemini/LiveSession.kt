@@ -10,6 +10,15 @@ data class CallerProfile(
     val occupation: String?,
 )
 
+/**
+ * Voice-activity-detection mode for a [LiveSession] (spec §4.4, §10 "Gemini-side VAD vs ours").
+ *  - [GEMINI_VAD]: Live API's automatic activity detection stays enabled server-side; we just
+ *    stream audio continuously and let Gemini decide turn boundaries.
+ *  - [LOCAL_VAD]: automatic activity detection is disabled in the setup message; our own VAD
+ *    gate (audio-pipeline milestone) drives [LiveSession.sendActivityStart]/[sendActivityEnd].
+ */
+enum class VadMode { GEMINI_VAD, LOCAL_VAD }
+
 /** One event emitted by an open [LiveSession]. */
 sealed interface LiveSessionEvent {
     /** 24 kHz mono PCM16 audio chunk from Gemini, ready to resample to 8 kHz and inject. */
@@ -19,35 +28,46 @@ sealed interface LiveSessionEvent {
 
     data class OutputTranscript(val text: String) : LiveSessionEvent
 
+    /** Server discarded/cancelled the in-flight model turn (barge-in). */
+    data object Interrupted : LiveSessionEvent
+
+    /** The model finished a turn (`serverContent.turnComplete`). */
+    data object TurnComplete : LiveSessionEvent
+
+    /** Watchdog timeout, socket failure, or a server error message. */
     data class Error(val message: String, val cause: Throwable? = null) : LiveSessionEvent
 
     data object Closed : LiveSessionEvent
 }
 
 /**
- * WebSocket session against the Gemini Live API (spec §4.4). M0 ships only the interface and a
- * stub; the Gemini-session worker implements the real OkHttp WebSocket client.
+ * WebSocket session against the Gemini Live API (spec §4.4).
  *
- * HANDOFF (Gemini-session worker):
- *  - Verify the current Flash Live model id in the Gemini API docs before replacing
- *    [bd.callbridge.Config.GEMINI_MODEL_ID].
- *  - Setup message: response modality audio, Bangla voice, system prompt (spec §6) with
- *    [CallerProfile] interpolated, input/output transcription enabled.
- *  - [sendAudio] takes 16 kHz PCM16 mono chunks (~100 ms, spec §4.4).
- *  - [interrupt] must map to the Live API's barge-in / activityStart signal and should also
- *    be triggered locally on our own VAD firing while [LiveSessionEvent.AudioOut] is playing.
- *  - Implement the 8 s watchdog (no socket message during an active call -> reopen, spec §4.4)
- *    at the call-orchestration layer that owns this session, not inside the implementation
- *    itself, so it stays unit-testable.
+ * Implemented by [GeminiLiveSession]. See `docs/gemini-live.md` for the verified message shapes,
+ * VAD-mode findings, and pricing sources.
  */
 interface LiveSession {
     /** Opens the socket and sends the setup message. Suspends until setup is acknowledged. */
     suspend fun open(systemPrompt: String, profile: CallerProfile)
 
-    /** Streams a 16 kHz PCM16 mono chunk to Gemini. */
+    /** Streams a 16 kHz PCM16 mono chunk (~100 ms) to Gemini as `realtimeInput.audio`. */
     fun sendAudio(pcm: ShortArray)
 
-    /** Signals barge-in: stop generating / discard in-flight output. */
+    /**
+     * Manual VAD signal: caller started speaking. Only meaningful with [VadMode.LOCAL_VAD]
+     * (automatic activity detection disabled in setup) — no-op otherwise.
+     */
+    fun sendActivityStart()
+
+    /** Manual VAD signal: caller stopped speaking. See [sendActivityStart]. */
+    fun sendActivityEnd()
+
+    /**
+     * Signals barge-in. With [VadMode.LOCAL_VAD] this sends `activityStart`, which under the
+     * default `activityHandling: START_OF_ACTIVITY_INTERRUPTS` cancels the in-flight generation
+     * server-side. With [VadMode.GEMINI_VAD] this is a no-op: the server's own VAD already
+     * detects the caller's speech and interrupts on its own.
+     */
     fun interrupt()
 
     /** Session events; terminates with [LiveSessionEvent.Closed] or an [LiveSessionEvent.Error]. */
@@ -56,20 +76,26 @@ interface LiveSession {
     suspend fun close()
 }
 
-/** Placeholder until the Gemini-session worker lands the OkHttp WebSocket implementation. */
+/** Placeholder retained for tests/wiring that want a no-op session without a real socket. */
 class UnimplementedLiveSession : LiveSession {
     override suspend fun open(systemPrompt: String, profile: CallerProfile): Nothing =
-        throw NotImplementedError("LiveSession is implemented by the Gemini-session milestone (M2).")
+        throw NotImplementedError("Use GeminiLiveSession for a real Live API connection.")
 
     override fun sendAudio(pcm: ShortArray): Nothing =
-        throw NotImplementedError("LiveSession is implemented by the Gemini-session milestone (M2).")
+        throw NotImplementedError("Use GeminiLiveSession for a real Live API connection.")
+
+    override fun sendActivityStart(): Nothing =
+        throw NotImplementedError("Use GeminiLiveSession for a real Live API connection.")
+
+    override fun sendActivityEnd(): Nothing =
+        throw NotImplementedError("Use GeminiLiveSession for a real Live API connection.")
 
     override fun interrupt(): Nothing =
-        throw NotImplementedError("LiveSession is implemented by the Gemini-session milestone (M2).")
+        throw NotImplementedError("Use GeminiLiveSession for a real Live API connection.")
 
     override val events: Flow<LiveSessionEvent>
-        get() = throw NotImplementedError("LiveSession is implemented by the Gemini-session milestone (M2).")
+        get() = throw NotImplementedError("Use GeminiLiveSession for a real Live API connection.")
 
     override suspend fun close(): Nothing =
-        throw NotImplementedError("LiveSession is implemented by the Gemini-session milestone (M2).")
+        throw NotImplementedError("Use GeminiLiveSession for a real Live API connection.")
 }

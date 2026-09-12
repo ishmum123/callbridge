@@ -11,7 +11,7 @@ Last updated: 2026-09-12 (M0 scaffold commit).
 | M0 — Dialer skeleton | on device: install verified, priv perms granted, default dialer set, first inbound call reached InCallService; callback flow crash fixed; demo flag `Config.ANSWER_UNREGISTERED_CALLERS=true` answers every caller (verified: inbound call auto-answered and held ACTIVE 2026-09-12 12:48). |
 | M1a — Capture | Code-complete, unit-tested (resampler THD/SNR, chunk-boundary continuity, VAD timing, mono→stereo). **Untested on a real device** — `AudioSource.VOICE_DOWNLINK`/`VOICE_CALL` need the priv-app install to actually initialize (`CAPTURE_AUDIO_OUTPUT`). |
 | M1b — Injection | Pending. `Injector` interface + `NoopInjector` + NDK/CMake toolchain proven (stub `nativeVersion()` JNI call); no real Route A/B/C implementation. |
-| M2 — Bridge | Pending. `LiveSession` interface + `UnimplementedLiveSession` stub exist; no OkHttp WebSocket client. |
+| M2 — Bridge | Code-complete, unit-tested + live-smoke-tested against the real Gemini Live API. `GeminiLiveSession` (real OkHttp WebSocket client), `TranscriptRecorder`, `CostModel`, `SystemPromptBuilder` land in `gemini/`. Not yet wired to `audio/`/`Injector`/`service/` (that's M3). See [`docs/gemini-live.md`](./gemini-live.md). |
 | M3 — Polish | Pending. |
 | M4 — Shop pilot | Pending. |
 
@@ -47,15 +47,16 @@ All three packages contain doc comments pointing at the exact file/interface to 
 - Implement `bd.callbridge.audio.Injector` (file: `Injector.kt`) as `InCallMusicInjector` (Route A), `TelephonyTxInjector` (Route B, plain `AudioTrack.setPreferredDevice`), and `LoopbackInjector` (Route C fallback). Wire selection through `bd.callbridge.audio.InjectorRoute` / `Config.injectorRoute`.
 - `docs/hal-recon.md` confirms Route A's mixer/audio-policy stanzas (`incall_music_uplink`, `Telephony Tx` device) are present on this firmware, so Route A is the primary path to implement first. There is no `su` binary and no `tinymix` on-device (see above) — any mixer-control toggling needs a bundled/prebuilt arm64 binary invoked directly (the app is already priv-app), not `su -c tinymix ...` as spec §4.3 step 3 literally says. Record the working control set in this doc once found.
 
-### Gemini-session worker (M2 bridge)
-- Implement `bd.callbridge.gemini.LiveSession` (file: `LiveSession.kt`) as a real OkHttp WebSocket client, replacing `UnimplementedLiveSession`.
-- **Verify the current Gemini Flash Live model id** against the Gemini API docs before replacing `Config.GEMINI_MODEL_ID` (currently a placeholder).
-- Setup message per spec §4.4: audio response modality, Bangla voice, system prompt (spec §6) with `CallerProfile` interpolated, input/output transcription enabled.
-- Implement the 8 s watchdog (spec §4.4) at the layer that owns the session (not inside `LiveSession` itself), so it stays unit-testable independent of the socket.
-- `sendAudio` takes 16 kHz PCM16 mono ~100 ms chunks; `AudioOut` events are 24 kHz PCM16, need resampling to 8 kHz before handing to `Injector.write()`.
+### Gemini-session worker (M2 bridge) — DONE, see `docs/gemini-live.md` for full detail
+- `GeminiLiveSession` (file: `gemini/GeminiLiveSession.kt`) is the real OkHttp WebSocket client. `Config.GEMINI_MODEL_ID`/`GEMINI_MODEL_FALLBACK` verified live against the real API (both present in this key's model list; primary confirmed working via `GeminiLiveSmokeTest`).
+- **Wire gotcha for whoever touches this next**: the real Live API sends every server message as a **binary** WS frame, not text. `GeminiLiveSession` implements both `onMessage(String)` and `onMessage(ByteString)` — if you ever replace/refactor the listener, keep the `ByteString` overload or the client will silently receive nothing and only the watchdog will tell you something's wrong.
+- Setup message shape, VAD modes (`VadMode.GEMINI_VAD` / `LOCAL_VAD`), `interrupt()` semantics, and the `bn-BD` → `bn-IN` languageCode deviation are all documented in `docs/gemini-live.md`.
+- Watchdog (spec §4.4, 8s) is implemented **inside** `GeminiLiveSession` itself (deviation from this note's original suggestion of the orchestration layer) — see `docs/gemini-live.md` for why.
+- `TranscriptRecorder` (file: `gemini/TranscriptRecorder.kt`) writes `turns` rows per completed turn and accumulates cost onto the `calls` row via `CostModel`; it also detects the `[HANGUP]` token and exposes `hangupRequested: SharedFlow<Unit>` — this is prompt-domain logic kept out of `GeminiLiveSession` on purpose.
+- **Not done (next milestone's job)**: wiring `LiveSession`/`TranscriptRecorder`/`SystemPromptBuilder` into `service/`, resampling `AudioOut` (24 kHz) down to 8 kHz before `Injector.write()`, resampling captured audio up to 16 kHz before `sendAudio`, and actually driving `sendActivityStart`/`sendActivityEnd` from the audio pipeline's VAD gate. `sendAudio` still just expects pre-resampled 16 kHz PCM16 mono ~100 ms chunks handed to it.
 
 ## Known deviations / open items from the spec
 
 - `CAPTURE_AUDIO_OUTPUT` / `MODIFY_PHONE_STATE` / etc. are declared in the manifest but are only functional once installed as a priv-app via the Magisk module — expected per spec §5, not a bug.
-- Gemini model id and Live API pricing figures in `callbridge-spec.md` §2/§9 are explicitly marked "verify" in the spec; `Config.GEMINI_MODEL_ID` is a placeholder pending that verification.
+- Gemini model id and Live API pricing figures in `callbridge-spec.md` §2/§9, marked "verify" in the spec, are now verified (2026-09-12) against live docs and a real API call — see `docs/gemini-live.md`. Both match the spec's placeholder values exactly.
 - No on-device testing was possible during the M0 build (no phone attached). All acceptance was via `./gradlew assembleDebug`/`test`/`lint` and `bash -n` on the install script.
