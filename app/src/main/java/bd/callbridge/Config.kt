@@ -1,0 +1,31 @@
+package bd.callbridge
+
+import bd.callbridge.audio.InjectorRoute
+
+/**
+ * Central config flags for the pilot build. Later milestones may move some of this to a
+ * DataStore/SharedPreferences-backed settings screen; for M0 these are compile-time constants
+ * plus one BuildConfig-sourced secret.
+ */
+object Config {
+    /** Selects which [bd.callbridge.audio.Injector] implementation BridgeForegroundService wires up.
+     *  M1b (injection worker) flips this once Route A/B is proven on-device; defaults to NOOP so
+     *  the app runs end-to-end on a plain (non-rooted) build without crashing. */
+    val injectorRoute: InjectorRoute = InjectorRoute.NOOP
+
+    /** Verified Gemini Live model ids (2026-09-12). [GEMINI_MODEL_ID] is the primary model the
+     *  Gemini-session worker (M2) should open; [GEMINI_MODEL_FALLBACK] is used if the primary
+     *  model/region is unavailable. Audio contract unchanged: 16 kHz PCM16 in, 24 kHz PCM16 out
+     *  (spec §2). */
+    const val GEMINI_MODEL_ID: String = "gemini-3.1-flash-live-preview"
+    const val GEMINI_MODEL_FALLBACK: String = "gemini-2.5-flash-native-audio-preview-12-2025"
+
+    /** Read from local.properties -> BuildConfig at build time. Never commit a real key. */
+    val geminiApiKey: String get() = BuildConfig.GEMINI_API_KEY
+
+    /** Seconds to wait after rejecting an unknown caller before calling back (spec §3, §4.1). */
+    const val CALLBACK_DELAY_SECONDS: Long = 2L
+
+    const val CAPTURE_SAMPLE_RATE_HZ: Int = 16_000
+    const val GEMINI_OUTPUT_SAMPLE_RATE_HZ: Int = 24_000
+}

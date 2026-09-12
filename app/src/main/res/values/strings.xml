@@ -1,0 +1,18 @@
+<resources>
+    <string name="app_name">CallBridge</string>
+    <string name="register_caller_title">Register Caller</string>
+    <string name="btn_hangup">Hang up</string>
+    <string name="btn_test_injection">Test injection</string>
+    <string name="btn_register_caller">Register caller</string>
+    <string name="label_state">State</string>
+    <string name="label_caller">Caller</string>
+    <string name="label_socket">Socket</string>
+    <string name="label_route">Injector route</string>
+    <string name="label_calls_today">Calls today</string>
+    <string name="label_cost_today">Est. cost today</string>
+    <string name="hint_number">Phone number</string>
+    <string name="hint_name">Name</string>
+    <string name="hint_village">Village</string>
+    <string name="hint_occupation">Occupation</string>
+    <string name="btn_save">Save</string>
+</resources>
