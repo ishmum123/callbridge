@@ -1,0 +1,10 @@
+<!doctype html><html><head><meta charset="utf-8"><title>CallBridge Admin</title>
+<script>
+  // Single-page-app fallback for GitHub Pages (spa-github-pages pattern).
+  var segs = 1; // number of base path segments (/callbridge/)
+  var l = window.location;
+  l.replace(l.protocol + '//' + l.hostname + (l.port ? ':' + l.port : '') +
+    l.pathname.split('/').slice(0, 1 + segs).join('/') + '/?p=/' +
+    l.pathname.slice(1).split('/').slice(segs).join('/').replace(/&/g, '~and~') +
+    (l.search ? '&q=' + l.search.slice(1).replace(/&/g, '~and~') : '') + l.hash);
+</script></head><body></body></html>

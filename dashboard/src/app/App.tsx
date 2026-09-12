@@ -62,7 +62,7 @@ function Shell() {
 export function App() {
   return (
     <DataSourceProvider>
-      <BrowserRouter>
+      <BrowserRouter basename={import.meta.env.BASE_URL.replace(/\/$/, '')}>
         <Routes>
           <Route element={<Shell />}>
             <Route index element={<OverviewPage />} />

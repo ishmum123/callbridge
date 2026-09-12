@@ -5,6 +5,17 @@
     
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>CallBridge Admin</title>
+    <script>
+      // Restore the deep link encoded by 404.html (GitHub Pages SPA fallback).
+      (function (l) {
+        if (l.search[1] === '/') return;
+        var m = /[?&]p=([^&]*)/.exec(l.search);
+        if (!m) return;
+        var q = /[?&]q=([^&]*)/.exec(l.search);
+        var base = l.pathname.replace(/\/$/, '');
+        window.history.replaceState(null, '', base + decodeURIComponent(m[1]).replace(/~and~/g, '&') + (q ? '?' + q[1].replace(/~and~/g, '&') : '') + l.hash);
+      })(window.location);
+    </script>
   </head>
   <body>
     <div id="root"></div>

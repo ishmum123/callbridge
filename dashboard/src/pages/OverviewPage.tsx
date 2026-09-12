@@ -2,11 +2,12 @@ import { useMemo, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { usePage } from '../app/PageContext';
 import { CallDetail } from '../components/CallDetail';
-import { TrendChart } from '../components/charts';
+import { C, HBar, TrendChart } from '../components/charts';
 import { DataTable, type Column } from '../components/DataTable';
 import { IconAlert, IconClock, IconDevice, IconDollar, IconFlag, IconPhone, IconUsers } from '../components/icons';
 import { Chip, KpiCard, OutcomeBadge, Panel, RiskBadge } from '../components/ui';
-import type { Call } from '../domain/types';
+import { HEALTH_PACK, type Call } from '../domain/types';
+import { domainMetrics } from '../metrics/domain';
 import { fmtDate, fmtDateTime, fmtDuration, fmtInt, fmtMs, fmtPct, fmtUsd } from '../metrics/format';
 import { dailySeries, deltaVsPrevious, overviewKpis, shopComparison, type ShopRow } from '../metrics/kpis';
 
@@ -18,6 +19,7 @@ export function OverviewPage() {
   const k = useMemo(() => overviewKpis(view), [view]);
   const series = useMemo(() => dailySeries(view), [view]);
   const shops = useMemo(() => shopComparison(view), [view]);
+  const symptoms = useMemo(() => domainMetrics(view, HEALTH_PACK).categories.symptom.slice(0, 8), [view]);
   const dCalls = useMemo(() => deltaVsPrevious(view, () => 1), [view]);
   const dCost = useMemo(() => deltaVsPrevious(view, (c) => c.estCostUsd), [view]);
   const dFailed = useMemo(() => deltaVsPrevious(view, (c) => (c.outcome === 'FAILED' ? 1 : 0)), [view]);
@@ -104,8 +106,8 @@ export function OverviewPage() {
       </div>
 
       <div className="grid two">
-        <Panel title="Shop comparison" flush testId="shop-comparison">
-          <DataTable rows={shops} columns={shopCols} rowKey={(r) => r.shop.id} pageSize={10} initialSort={{ key: 'calls', dir: 'desc' }} exportName="shop-comparison" caption="Shop comparison" onRowClick={(r) => nav(`/shops?shop=${r.shop.id}`)} />
+        <Panel title="Common symptoms" aiNote testId="overview-symptoms" tools={<Link to="/insights" className="btn sm">Health insights</Link>}>
+          {symptoms.length ? <HBar data={symptoms} color={C.teal} onClick={() => nav('/calls?category=symptom')} /> : <div className="state" style={{ padding: 20 }}>No symptoms extracted in range.</div>}
         </Panel>
         <Panel title="Recent failures" tools={<Link to="/calls?outcome=FAILED" className="btn sm">All failures</Link>} flush>
           {recentFailures.length === 0 && <div className="state" style={{ padding: 24 }}>No failed calls in range.</div>}
@@ -122,6 +124,12 @@ export function OverviewPage() {
               </li>
             ))}
           </ul>
+        </Panel>
+      </div>
+
+      <div className="grid">
+        <Panel title="Shop comparison" flush testId="shop-comparison">
+          <DataTable rows={shops} columns={shopCols} rowKey={(r) => r.shop.id} pageSize={10} initialSort={{ key: 'calls', dir: 'desc' }} exportName="shop-comparison" caption="Shop comparison" onRowClick={(r) => nav(`/shops?shop=${r.shop.id}`)} />
         </Panel>
       </div>
 
