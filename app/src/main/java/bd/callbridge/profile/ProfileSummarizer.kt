@@ -98,7 +98,15 @@ class ProfileSummarizer(
         val existing = profileDao.find(call.number)
         val requestJson = buildRequestBody(existing, turns)
 
-        val callResult = runCatching { callGenerateContent(requestJson) }
+        // Retry: the call ends right as the phone's default network flips (Wi-Fi ↔ LTE), and the
+        // first attempt often times out on slow venue networks (observed 2026-09-12).
+        var callResult: Result<String> = Result.failure(IllegalStateException("not attempted"))
+        for ((attempt, backoffMs) in listOf(0L, 3_000L, 8_000L).withIndex()) {
+            if (backoffMs > 0) kotlinx.coroutines.delay(backoffMs)
+            callResult = runCatching { callGenerateContent(requestJson) }
+            if (callResult.isSuccess) break
+            Log.w(TAG, "onCallFinished($callId): generateContent attempt ${attempt + 1} failed: ${callResult.exceptionOrNull()?.message?.take(LOG_PREVIEW_CHARS)}")
+        }
         callResult.onFailure {
             Log.e(TAG, "onCallFinished($callId): generateContent call failed: ${it.message?.take(LOG_PREVIEW_CHARS)}")
         }
@@ -311,7 +319,7 @@ class ProfileSummarizer(
     companion object {
         private const val TAG = "ProfileSummarizer"
         private const val LOG_PREVIEW_CHARS = 80
-        private const val CALL_TIMEOUT_SECONDS = 30L
+        private const val CALL_TIMEOUT_SECONDS = 60L
         private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
         val json = Json { ignoreUnknownKeys = true; explicitNulls = false }
 

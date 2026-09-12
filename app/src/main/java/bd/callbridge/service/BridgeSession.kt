@@ -122,6 +122,9 @@ class BridgeSession(
      *  hanging up anyway, and (separately) how long [open] is allowed to take before [start]
      *  gives up. */
     private val drainTimeoutMs: Long = 4_000L,
+    /** 24 kHz PCM16 mono "একটু অপেক্ষা করুন" clip played into the call the moment a tool lookup
+     *  starts, so the caller hears something during the ~2-4 s search + regeneration gap. */
+    private val waitClipPcm24k: ShortArray? = null,
     /** Closing phrase seen within this window after ACTIVE is treated as part of the greeting. */
     private val hangupIgnoreWindowMs: Long = HANGUP_IGNORE_WINDOW_MS,
     /** [LiveSessionEvent.AudioOut] handling — including the potentially-blocking
@@ -331,6 +334,7 @@ class BridgeSession(
 
         val question = event.args["question"]?.jsonPrimitive?.contentOrNull.orEmpty()
         Log.i(TAG, "ToolCall received id=${event.id} name=${event.name} question=$question")
+        playWaitClip()
         val job = scope.launch(exceptionHandler + toolLookupDispatcher) {
             val startedAtMs = nowMs()
             val answer = try {
@@ -401,6 +405,22 @@ class BridgeSession(
         }
         val resampled = resampler.process(event.pcm)
         if (resampled.isNotEmpty()) withContext(injectorDispatcher) { injector.write(resampled) }
+    }
+
+    /** Fire-and-forget: injects [waitClipPcm24k] (resampled to the injector rate). Marks the
+     *  model as speaking so half-duplex mode doesn't feed the clip's line echo back to Gemini. */
+    private fun playWaitClip() {
+        val clip = waitClipPcm24k ?: return
+        val job = scope.launch(exceptionHandler) {
+            val targetRate = injector.openSampleRateHz ?: Config.CAPTURE_SAMPLE_RATE_HZ
+            val pcm = if (targetRate == Config.GEMINI_OUTPUT_SAMPLE_RATE_HZ) clip
+                      else Resampler(Config.GEMINI_OUTPUT_SAMPLE_RATE_HZ, targetRate).process(clip)
+            Log.i(TAG, "playing wait clip (${clip.size * 1000 / Config.GEMINI_OUTPUT_SAMPLE_RATE_HZ} ms)")
+            isModelSpeaking = true
+            lastModelAudioMs = nowMs() + clip.size * 1000L / Config.GEMINI_OUTPUT_SAMPLE_RATE_HZ
+            withContext(injectorDispatcher) { injector.write(pcm) }
+        }
+        jobs += job
     }
 
     private fun handleVadEvent(event: VadGate.Event) {
@@ -565,6 +585,8 @@ object BridgeSessionFactory {
         val injector = InjectorFactory.create(Config.injectorRoute, context)
         val capture = VoiceCallCapture(context)
         val pipeline = AudioPipeline(capture, gateAudio = vadMode == VadMode.LOCAL_VAD)
+        val waitClip = runCatching { loadRawWavPcm16(context, bd.callbridge.R.raw.wait_24k) }
+            .onFailure { Log.w(TAG, "wait clip unavailable", it) }.getOrNull()
         val transcriptRecorder = TranscriptRecorder(
             callId = callId,
             turnDao = turnDao,
@@ -575,6 +597,7 @@ object BridgeSessionFactory {
             liveSession = liveSession,
             injector = injector,
             transcriptRecorder = transcriptRecorder,
+            waitClipPcm24k = waitClip,
             pipelineEvents = pipeline.events,
             systemPrompt = systemPrompt,
             callerProfile = callerProfile,
@@ -588,5 +611,15 @@ object BridgeSessionFactory {
     }
 }
 
-private const val MODEL_IDLE_MS = 800L
+private const val MODEL_IDLE_MS = 600L
 private const val HANGUP_IGNORE_WINDOW_MS = 15_000L
+
+/** Reads a 16-bit PCM WAV from res/raw (44-byte canonical header assumed) into a ShortArray. */
+private fun loadRawWavPcm16(context: android.content.Context, resId: Int): ShortArray {
+    val bytes = context.resources.openRawResource(resId).use { it.readBytes() }
+    val dataStart = 44
+    val n = (bytes.size - dataStart) / 2
+    val out = ShortArray(n)
+    java.nio.ByteBuffer.wrap(bytes, dataStart, n * 2).order(java.nio.ByteOrder.LITTLE_ENDIAN).asShortBuffer().get(out)
+    return out
+}
