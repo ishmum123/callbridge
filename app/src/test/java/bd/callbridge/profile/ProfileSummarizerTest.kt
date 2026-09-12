@@ -10,6 +10,7 @@ import bd.callbridge.store.dao.CallDao
 import bd.callbridge.store.dao.PatientProfileDao
 import bd.callbridge.store.dao.ProfileUpdateDao
 import bd.callbridge.store.dao.TurnDao
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.flowOf
@@ -61,6 +62,11 @@ private class FakeProfileUpdateDao : ProfileUpdateDao {
     override fun observeForNumber(number: String): Flow<List<ProfileUpdateEntity>> =
         flowOf(inserted.filter { it.number == number })
     override suspend fun forNumber(number: String): List<ProfileUpdateEntity> = inserted.filter { it.number == number }
+    override suspend fun existsForCall(callId: Long): Boolean = inserted.any { it.callId == callId }
+    override suspend fun countForNumber(number: String): Int = inserted.count { it.number == number }
+    override suspend fun deleteForCall(callId: Long) {
+        inserted.removeAll { it.callId == callId }
+    }
 }
 
 class ProfileSummarizerTest {
@@ -230,5 +236,203 @@ class ProfileSummarizerTest {
 
         assertTrue(updateDao.inserted.isEmpty())
         assertNotNull(profileDao.existing?.lastError)
+    }
+
+    // --- N3: accumulate semantics for list fields --------------------------------------------
+
+    @Test
+    fun `model returns empty arrays, existing allergies and conditions are retained`() = runTest {
+        val callDao = FakeCallDao(mutableMapOf(1L to call))
+        val turnDao = FakeTurnDao(listOf(TurnEntity(callId = 1L, role = TurnRole.CALLER, text = "hi", tMs = 0L)))
+        val profileDao = FakePatientProfileDao()
+        profileDao.existing = PatientProfileEntity(
+            number = "01700000001",
+            chronicConditions = listOf("diabetes"),
+            medications = listOf("metformin"),
+            allergies = listOf("penicillin"),
+            riskFlags = listOf("pregnant"),
+            adviceGiven = listOf("drink water"),
+            callCount = 1,
+        )
+        val updateDao = FakeProfileUpdateDao()
+        val summarizer = newSummarizer(callDao, turnDao, profileDao, updateDao)
+
+        val emptyListsBody = """
+            {
+              "displayName": null, "ageYears": null, "sex": null, "village": null,
+              "chronicConditions": [], "currentSymptoms": [], "medications": [], "allergies": [],
+              "riskFlags": [], "adviceGiven": [], "followUpNeeded": false, "followUpNote": null,
+              "summaryBn": "স", "summaryEn": "s", "deltaSummary": "nothing new"
+            }
+        """.trimIndent()
+        server.enqueue(MockResponse().setResponseCode(200).setBody(mockGenerateContentResponse(emptyListsBody)))
+
+        summarizer.onCallFinished(1L)
+
+        val profile = profileDao.existing
+        assertNotNull(profile)
+        assertEquals(listOf("diabetes"), profile!!.chronicConditions)
+        assertEquals(listOf("metformin"), profile.medications)
+        assertEquals(listOf("penicillin"), profile.allergies)
+        assertEquals(listOf("pregnant"), profile.riskFlags)
+        assertEquals(listOf("drink water"), profile.adviceGiven)
+    }
+
+    @Test
+    fun `list fields union case-insensitively without duplicating existing entries`() = runTest {
+        val callDao = FakeCallDao(mutableMapOf(1L to call))
+        val turnDao = FakeTurnDao(listOf(TurnEntity(callId = 1L, role = TurnRole.CALLER, text = "hi", tMs = 0L)))
+        val profileDao = FakePatientProfileDao()
+        profileDao.existing = PatientProfileEntity(
+            number = "01700000001",
+            chronicConditions = listOf("Diabetes"),
+            riskFlags = listOf("pregnant"),
+        )
+        val updateDao = FakeProfileUpdateDao()
+        val summarizer = newSummarizer(callDao, turnDao, profileDao, updateDao)
+
+        val body = """
+            {
+              "displayName": null, "ageYears": null, "sex": null, "village": null,
+              "chronicConditions": ["diabetes", "hypertension"], "currentSymptoms": [],
+              "medications": [], "allergies": [], "riskFlags": ["pregnant", "fever >3 days"],
+              "adviceGiven": [], "followUpNeeded": false, "followUpNote": null,
+              "summaryBn": "স", "summaryEn": "s", "deltaSummary": "new condition"
+            }
+        """.trimIndent()
+        server.enqueue(MockResponse().setResponseCode(200).setBody(mockGenerateContentResponse(body)))
+
+        summarizer.onCallFinished(1L)
+
+        val profile = profileDao.existing!!
+        // "diabetes" not duplicated despite case difference; "hypertension" newly added.
+        assertEquals(listOf("Diabetes", "hypertension"), profile.chronicConditions)
+        assertEquals(listOf("pregnant", "fever >3 days"), profile.riskFlags)
+    }
+
+    // --- n7: idempotent per callId, callCount derived from profile_updates rows --------------
+
+    @Test
+    fun `re-running onCallFinished for the same callId without force is a no-op`() = runTest {
+        val callDao = FakeCallDao(mutableMapOf(1L to call))
+        val turnDao = FakeTurnDao(listOf(TurnEntity(callId = 1L, role = TurnRole.CALLER, text = "hi", tMs = 0L)))
+        val profileDao = FakePatientProfileDao()
+        val updateDao = FakeProfileUpdateDao()
+        val summarizer = newSummarizer(callDao, turnDao, profileDao, updateDao)
+
+        server.enqueue(MockResponse().setResponseCode(200).setBody(mockGenerateContentResponse(successJsonBody)))
+        summarizer.onCallFinished(1L)
+        assertEquals(1, server.requestCount)
+        assertEquals(1, profileDao.existing?.callCount)
+        assertEquals(1, updateDao.inserted.size)
+
+        // Second call, same callId, no force: should skip entirely (no HTTP call, no new row).
+        summarizer.onCallFinished(1L)
+        assertEquals(1, server.requestCount)
+        assertEquals(1, profileDao.existing?.callCount)
+        assertEquals(1, updateDao.inserted.size)
+    }
+
+    @Test
+    fun `force re-run replaces the call's update row instead of duplicating it`() = runTest {
+        val callDao = FakeCallDao(mutableMapOf(1L to call))
+        val turnDao = FakeTurnDao(listOf(TurnEntity(callId = 1L, role = TurnRole.CALLER, text = "hi", tMs = 0L)))
+        val profileDao = FakePatientProfileDao()
+        val updateDao = FakeProfileUpdateDao()
+        val summarizer = newSummarizer(callDao, turnDao, profileDao, updateDao)
+
+        server.enqueue(MockResponse().setResponseCode(200).setBody(mockGenerateContentResponse(successJsonBody)))
+        summarizer.onCallFinished(1L)
+        assertEquals(1, updateDao.inserted.size)
+        assertEquals(1, profileDao.existing?.callCount)
+
+        server.enqueue(MockResponse().setResponseCode(200).setBody(mockGenerateContentResponse(successJsonBody)))
+        summarizer.onCallFinished(1L, force = true)
+
+        assertEquals(2, server.requestCount)
+        // Still exactly one update row for this call (replaced, not duplicated) so callCount
+        // doesn't inflate from re-summarizing the same call twice.
+        assertEquals(1, updateDao.inserted.size)
+        assertEquals(1, profileDao.existing?.callCount)
+    }
+
+    @Test
+    fun `callCount is derived from distinct calls with an update row, not an incrementing counter`() = runTest {
+        val call2 = call.copy(id = 2L)
+        val callDao = FakeCallDao(mutableMapOf(1L to call, 2L to call2))
+        val turnDao = FakeTurnDao(
+            listOf(
+                TurnEntity(callId = 1L, role = TurnRole.CALLER, text = "hi", tMs = 0L),
+                TurnEntity(callId = 2L, role = TurnRole.CALLER, text = "hi again", tMs = 0L),
+            )
+        )
+        val profileDao = FakePatientProfileDao()
+        val updateDao = FakeProfileUpdateDao()
+        val summarizer = newSummarizer(callDao, turnDao, profileDao, updateDao)
+
+        server.enqueue(MockResponse().setResponseCode(200).setBody(mockGenerateContentResponse(successJsonBody)))
+        summarizer.onCallFinished(1L)
+        server.enqueue(MockResponse().setResponseCode(200).setBody(mockGenerateContentResponse(successJsonBody)))
+        summarizer.onCallFinished(2L)
+
+        assertEquals(2, profileDao.existing?.callCount)
+        assertEquals(2, updateDao.inserted.size)
+    }
+
+    // --- n2/n3: multi-part responses and MAX_TOKENS finishReason ------------------------------
+
+    @Test
+    fun `text parts are concatenated across multiple response parts`() = runTest {
+        val callDao = FakeCallDao(mutableMapOf(1L to call))
+        val turnDao = FakeTurnDao(listOf(TurnEntity(callId = 1L, role = TurnRole.CALLER, text = "hi", tMs = 0L)))
+        val profileDao = FakePatientProfileDao()
+        val updateDao = FakeProfileUpdateDao()
+        val summarizer = newSummarizer(callDao, turnDao, profileDao, updateDao)
+
+        val splitPoint = successJsonBody.length / 2
+        val part1 = successJsonBody.substring(0, splitPoint).replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n")
+        val part2 = successJsonBody.substring(splitPoint).replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n")
+        val multiPartResponse = """{"candidates":[{"content":{"parts":[{"text":"$part1"},{"text":"$part2"}]}}]}"""
+        server.enqueue(MockResponse().setResponseCode(200).setBody(multiPartResponse))
+
+        summarizer.onCallFinished(1L)
+
+        assertEquals("Karim", profileDao.existing?.displayName)
+        assertNull(profileDao.existing?.lastError)
+    }
+
+    @Test
+    fun `MAX_TOKENS finishReason is recorded as an error, not parsed as a truncated profile`() = runTest {
+        val callDao = FakeCallDao(mutableMapOf(1L to call))
+        val turnDao = FakeTurnDao(listOf(TurnEntity(callId = 1L, role = TurnRole.CALLER, text = "hi", tMs = 0L)))
+        val profileDao = FakePatientProfileDao()
+        val updateDao = FakeProfileUpdateDao()
+        val summarizer = newSummarizer(callDao, turnDao, profileDao, updateDao)
+
+        val escaped = successJsonBody.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n")
+        val truncatedResponse = """{"candidates":[{"content":{"parts":[{"text":"$escaped"}]},"finishReason":"MAX_TOKENS"}]}"""
+        server.enqueue(MockResponse().setResponseCode(200).setBody(truncatedResponse))
+
+        summarizer.onCallFinished(1L)
+
+        assertTrue(updateDao.inserted.isEmpty())
+        assertNotNull(profileDao.existing?.lastError)
+        assertTrue(profileDao.existing!!.lastError!!.contains("MAX_TOKENS"))
+    }
+
+    // --- n4: CancellationException must propagate, never be swallowed ------------------------
+
+    @Test(expected = CancellationException::class)
+    fun `CancellationException from a dao is rethrown, not swallowed`() = runTest {
+        val cancellingTurnDao = object : TurnDao {
+            override suspend fun insert(turn: TurnEntity): Long = throw NotImplementedError()
+            override suspend fun forCall(callId: Long): List<TurnEntity> = throw CancellationException("cancelled")
+        }
+        val callDao = FakeCallDao(mutableMapOf(1L to call))
+        val profileDao = FakePatientProfileDao()
+        val updateDao = FakeProfileUpdateDao()
+        val summarizer = newSummarizer(callDao, cancellingTurnDao, profileDao, updateDao)
+
+        summarizer.onCallFinished(1L)
     }
 }

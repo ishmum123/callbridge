@@ -66,7 +66,11 @@ class DebugInjectReceiver : BroadcastReceiver() {
             }
             ACTION_SUMMARIZE -> {
                 val callId = if (intent.hasExtra(EXTRA_CALL_ID)) intent.getLongExtra(EXTRA_CALL_ID, -1L) else null
-                runSummarizeTest(appContext, callId, pendingResult)
+                // Debug re-runs should always force past the idempotency guard by default (that's
+                // the point of this broadcast — re-summarize on demand) but allow overriding to
+                // exercise the skip-if-already-summarized path from adb too.
+                val force = intent.getBooleanExtra(EXTRA_FORCE, true)
+                runSummarizeTest(appContext, callId, force, pendingResult)
             }
             ACTION_SEED_CALL -> {
                 val number = intent.getStringExtra(EXTRA_NUMBER) ?: DEFAULT_SEED_NUMBER
@@ -251,7 +255,7 @@ class DebugInjectReceiver : BroadcastReceiver() {
      * Patient profile feature be exercised from adb without wiring it into a real live call
      * (that wiring is left to whoever owns `CallController`/`BridgeSession`).
      */
-    private fun runSummarizeTest(appContext: Context, callId: Long?, pendingResult: PendingResult) {
+    private fun runSummarizeTest(appContext: Context, callId: Long?, force: Boolean, pendingResult: PendingResult) {
         CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
             try {
                 val app = appContext as CallBridgeApp
@@ -260,8 +264,8 @@ class DebugInjectReceiver : BroadcastReceiver() {
                     Log.w(TAG, "InjectTest: SUMMARIZE no calls in DB, nothing to summarize")
                     return@launch
                 }
-                Log.i(TAG, "InjectTest: SUMMARIZE starting callId=$resolvedId")
-                app.profileSummarizer.onCallFinished(resolvedId)
+                Log.i(TAG, "InjectTest: SUMMARIZE starting callId=$resolvedId force=$force")
+                app.profileSummarizer.onCallFinished(resolvedId, force = force)
                 val call = app.database.callDao().findById(resolvedId)
                 val profile = call?.let { app.database.patientProfileDao().find(it.number) }
                 Log.i(
@@ -338,6 +342,7 @@ class DebugInjectReceiver : BroadcastReceiver() {
         private const val EXTRA_SECONDS = "seconds"
         private const val EXTRA_FREQ = "freq"
         private const val EXTRA_CALL_ID = "callId"
+        private const val EXTRA_FORCE = "force"
         private const val EXTRA_NUMBER = "number"
         private const val DEFAULT_SEED_NUMBER = "01700000099"
 

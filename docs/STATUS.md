@@ -207,17 +207,41 @@ live call flow — that one line is left for whoever owns `CallController`/`Brid
 - **Store**: `PatientProfileEntity` (keyed by phone number) + `ProfileUpdateEntity` (per-call
   delta history) in `store/Entities.kt`; `PatientProfileDao`/`ProfileUpdateDao` in
   `store/dao/Daos.kt`; `ProfileRepository`/`RoomProfileRepository` in `store/ProfileRepository.kt`.
-  DB bumped to `version = 2` with `fallbackToDestructiveMigration()` (demo-acceptable; no
-  migration path from v1). List-of-string fields are stored as JSON via new `Converters`
-  (`fromStringList`/`toStringList`).
-- **Summarizer**: `profile/ProfileSummarizer.kt`. `suspend fun onCallFinished(callId: Long)` loads
-  the call's `turns` + any existing profile, calls Gemini's REST `generateContent` endpoint
-  (`Config.GEMINI_SUMMARY_MODEL_ID = "gemini-2.5-flash"` — **not** the Live API/WebSocket) with
-  `responseMimeType: application/json` + a `responseSchema` matching the entity, and asks the
-  model to return the *complete merged* profile (existing facts kept unless contradicted) plus a
-  `deltaSummary` for the per-call history row. Runs on `Dispatchers.IO`, never throws to the
-  caller; an empty transcript is skipped entirely; any HTTP/parse failure is logged and recorded
-  as `PatientProfileEntity.lastError`, leaving the rest of the profile untouched.
+  DB bumped to `version = 2` with a real `MIGRATION_1_2` (`store/CallBridgeDatabase.kt`) that
+  creates `patient_profiles`/`profile_updates` (+ its `number` index) with SQL copied verbatim
+  from the exported schema (`app/schemas/.../2.json`); `fallbackToDestructiveMigration()` stays
+  registered only as a backstop for a *future* version bump that ships without its own migration.
+  Verified by `store/CallBridgeMigrationTest.kt` (Robolectric — builds a real v1 SQLite file by
+  hand from `1.json`'s SQL, sets its `user_version` pragma, opens it through `CallBridgeDatabase`
+  with `MIGRATION_1_2` registered so Android's real `onUpgrade(1,2)` path runs, then asserts prior
+  `callers` data survived and the new tables are fully queryable). List-of-string fields are
+  stored as JSON via `Converters` (`fromStringList`/`toStringList`).
+- **Summarizer**: `profile/ProfileSummarizer.kt`. `suspend fun onCallFinished(callId: Long, force:
+  Boolean = false)` loads the call's `turns` + any existing profile, calls Gemini's REST
+  `generateContent` endpoint (`Config.GEMINI_SUMMARY_MODEL_ID = "gemini-2.5-flash"` — **not** the
+  Live API/WebSocket, 30s `callTimeout`) with `responseMimeType: application/json` + a
+  `responseSchema` matching the entity, and asks the model for the *complete merged* profile plus
+  a `deltaSummary` for the per-call history row. Runs on `Dispatchers.IO`, never throws to the
+  caller (`CancellationException` is rethrown, everything else caught); an empty transcript is
+  skipped entirely; any HTTP/parse failure or a `finishReason=MAX_TOKENS` truncation is logged
+  (length + 80-char preview only, never a raw body/model-output dump — see PII note below) and
+  recorded as `PatientProfileEntity.lastError`, leaving the rest of the profile untouched.
+  Response parsing concatenates *all* of `candidates[0].content.parts[*].text` (not just
+  `parts[0]`), and logs `finishReason` on every call.
+  - **Accumulate semantics enforced in code, not left to the model**: `chronicConditions`,
+    `medications`, `allergies`, `riskFlags`, `adviceGiven` are a case-insensitive union of the
+    existing profile + the model's output (order preserved, deduped) — so an empty array back
+    from the model can never silently drop prior facts. `currentSymptoms`,
+    `followUpNeeded`/`followUpNote`, `summaryBn`/`summaryEn`, and the scalar identity fields
+    remain model-authoritative (latest call wins / non-null overrides).
+  - **Idempotent per callId, `callCount` derived not incremented**: a `profile_updates` row
+    existing for a `callId` short-circuits `onCallFinished` (no HTTP call, profile untouched)
+    unless `force = true`. `callCount` is computed as `count(profile_updates for number) + 1`
+    (this call's prior row, if any, is deleted first) rather than `existing.callCount + 1`, so a
+    forced re-summarize of the same call replaces its update row instead of double-counting.
+  - **PII in logs**: phone numbers are masked via `util/Redact.kt` (`Redact.phone("+8801700000784")
+    -> "+88017…784"`); HTTP bodies and raw model output are never logged verbatim, only
+    length + an 80-char preview.
   Verified against the real API: `ProfileSummarizerSmokeTest` (gated exactly like
   `GeminiLiveSmokeTest` — `-PliveSmoke=true` + `GEMINI_API_KEY` in `local.properties`) got back a
   correctly-parsed profile with Bangla + English summaries from a real Bangla fever/cough
@@ -228,7 +252,9 @@ live call flow — that one line is left for whoever owns `CallController`/`Brid
   ```kotlin
   (applicationContext as CallBridgeApp).profileSummarizer.onCallFinished(callId)
   ```
-  Fire-and-forget from a non-blocking scope is fine.
+  Fire-and-forget from a non-blocking scope is fine. Pass `force = true` only for an intentional
+  re-summarize (e.g. the debug broadcast below) — the normal path should rely on the default
+  `force = false` idempotency guard.
 - **Debug path** (exercise without a live call): `DebugInjectReceiver` gained two actions
   (`app/src/debug/java/bd/callbridge/debug/DebugInjectReceiver.kt`,
   `app/src/debug/AndroidManifest.xml`):
@@ -236,22 +262,30 @@ live call flow — that one line is left for whoever owns `CallController`/`Brid
   adb shell am broadcast -a bd.callbridge.DEBUG_SEED_CALL --es number 01700000099
   adb shell am broadcast -a bd.callbridge.DEBUG_SUMMARIZE
   adb shell am broadcast -a bd.callbridge.DEBUG_SUMMARIZE --el callId 1
+  adb shell am broadcast -a bd.callbridge.DEBUG_SUMMARIZE --el callId 1 --ez force false
   adb logcat -s InjectTest
   ```
   `DEBUG_SEED_CALL` inserts a finished fake call with a realistic 6-turn Bangla transcript (fever
   + cough, then the same caller asking about iron tablets as a pregnant woman). `DEBUG_SUMMARIZE`
-  runs the summarizer for a given `callId` or the most recent call if omitted.
+  runs the summarizer for a given `callId` or the most recent call if omitted, defaulting to
+  `force=true` (that's the point of the broadcast — pass `--ez force false` to exercise the
+  skip-if-already-summarized path instead).
 - **UI**: `ui/PatientsListActivity.kt` (list of profiles — name/number, last call, risk-flag
   chips, follow-up badge; reachable from `StatusActivity`'s new "Patients" button) and
   `ui/PatientDetailActivity.kt` (all fields grouped: Summary / Conditions & symptoms /
   Medications & allergies / Risk flags / Advice & follow-up / Call history with per-call delta).
   Plain Views + view binding + Material components (`MaterialCardView`, `Chip`), matching the
-  rest of the app's UI toolkit — no new dependency added.
+  rest of the app's UI toolkit — no new dependency added. Neither activity logs anything today,
+  so there was nothing to retrofit with `Redact` there; kept in mind for whoever adds logging.
 - **Tests**: `profile/ProfileSummarizerTest.kt` (MockWebServer — empty-transcript skip, successful
   merge + delta row, HTTP failure records `lastError` without touching existing fields, unparsable
-  JSON handled the same way), `store/PatientProfileDaoTest.kt` (Robolectric, same pattern as
-  `CaptureWavDumperTest` — upsert/find round-trip including list columns, REPLACE-on-conflict,
-  update-history ordering), `profile/ProfileSummarizerSmokeTest.kt` (real-API gated smoke test).
+  JSON handled the same way, empty-array accumulate retention, case-insensitive union dedupe,
+  idempotent no-op re-run, force re-run replaces instead of duplicates, `callCount` derived across
+  two distinct calls, multi-part response concatenation, `MAX_TOKENS` recorded as an error,
+  `CancellationException` propagates), `store/PatientProfileDaoTest.kt` (Robolectric, same pattern
+  as `CaptureWavDumperTest` — upsert/find round-trip including list columns, REPLACE-on-conflict,
+  update-history ordering), `store/CallBridgeMigrationTest.kt` (Robolectric, real v1->v2 migration
+  — see Store section above), `profile/ProfileSummarizerSmokeTest.kt` (real-API gated smoke test).
 
 ## Known deviations / open items from the spec
 
