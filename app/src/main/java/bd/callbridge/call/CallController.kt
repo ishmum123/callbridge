@@ -20,6 +20,27 @@ private const val TAG = "CallController"
 private const val BUSY_SMS_TEXT = "Sorry, we're on another call right now. We'll call you back."
 
 /**
+ * M3 hook: [CallController] notifies this of the Telecom lifecycle events that matter for
+ * starting/stopping a [bd.callbridge.service.BridgeSession] (capture -> Gemini -> injector for
+ * one call), without [CallController] itself knowing anything about audio/Gemini/injection.
+ * Implemented by [bd.callbridge.service.BridgeSessionManager]. All methods are fire-and-forget
+ * from [CallController]'s point of view — the coordinator owns its own coroutine scope and must
+ * never let an exception escape back into a Telecom callback.
+ */
+interface CallSessionCoordinator {
+    /** The call reached [CallState.ACTIVE]. [call] is the live Telecom call object (for anything
+     *  the session needs from it beyond the number); [number] is the caller's number. */
+    fun onCallActive(call: Call, number: String)
+
+    /** The active call ended (Telecom `onCallRemoved`/`STATE_DISCONNECTED`). Safe to call even
+     *  when no session is running. */
+    fun onCallEnded()
+
+    /** [CallBridgeInCallService] is being destroyed; tear down any session as a safety net. */
+    fun onServiceDestroyed()
+}
+
+/**
  * Bridges [CallBridgeInCallService]'s Telecom [Call] callbacks to the pure [CallStateMachine]
  * and executes the [CallAction]s it returns (spec §4.1: answer/reject/disconnect/placeCall/SMS).
  *
@@ -36,6 +57,8 @@ class CallController(
     private val context: Context,
     private val callerRepository: CallerRepository,
     private val stateMachine: CallStateMachine = CallStateMachine(),
+    /** M3 wiring hook; null keeps this class runnable standalone (as in every M0/M1/M2 test). */
+    private val sessionCoordinator: CallSessionCoordinator? = null,
     private val scope: CoroutineScope = CoroutineScope(
         SupervisorJob() + Dispatchers.Default + CoroutineExceptionHandler { _, throwable ->
             Log.w(TAG, "Unhandled exception in CallController scope", throwable)
@@ -87,6 +110,13 @@ class CallController(
         val actions = stateMachine.onCallActive()
         logIfIllegal()
         execute(actions, activeTelecomCall)
+
+        val call = activeTelecomCall
+        val number = stateMachine.currentNumber
+        if (call != null && number != null && stateMachine.state == CallState.ACTIVE) {
+            runCatching { sessionCoordinator?.onCallActive(call, number) }
+                .onFailure { Log.e(TAG, "sessionCoordinator.onCallActive threw", it) }
+        }
     }
 
     /**
@@ -95,6 +125,9 @@ class CallController(
      * both for the same call.
      */
     fun onCallRemoved() {
+        runCatching { sessionCoordinator?.onCallEnded() }
+            .onFailure { Log.e(TAG, "sessionCoordinator.onCallEnded threw", it) }
+
         if (stateMachine.state == CallState.IDLE) return // already fully settled - no-op
 
         val actions = stateMachine.onCallEnded()
@@ -114,6 +147,8 @@ class CallController(
      *  that outlives any one InCallService binding. */
     fun onServiceDestroyed() {
         cancelPendingCallback()
+        runCatching { sessionCoordinator?.onServiceDestroyed() }
+            .onFailure { Log.e(TAG, "sessionCoordinator.onServiceDestroyed threw", it) }
     }
 
     fun hangUp() {

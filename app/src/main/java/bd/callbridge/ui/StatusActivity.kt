@@ -9,11 +9,13 @@ import android.os.Bundle
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.lifecycleScope
 import bd.callbridge.CallBridgeApp
 import bd.callbridge.audio.NativeBridge
 import bd.callbridge.Config
 import bd.callbridge.databinding.ActivityStatusBinding
 import bd.callbridge.service.BridgeForegroundService
+import kotlinx.coroutines.launch
 
 /**
  * Status screen (spec §4.6): state, caller number, socket status, injector route, calls today,
@@ -50,6 +52,7 @@ class StatusActivity : AppCompatActivity() {
         requestDefaultDialerRoleIfNeeded()
         requestMissingRuntimePermissions()
         BridgeForegroundService.start(this)
+        observeBridgeStatus()
 
         binding.btnHangup.setOnClickListener {
             (application as CallBridgeApp).callController.hangUp()
@@ -70,6 +73,21 @@ class StatusActivity : AppCompatActivity() {
         binding.textRoute.text = "Injector route: ${Config.injectorRoute} (native: ${runCatching { NativeBridge.nativeVersion() }.getOrDefault("n/a")})"
         binding.textCallsToday.text = "Calls today: 0"
         binding.textCostToday.text = "Est. cost today: $0.00"
+    }
+
+    /** M3: live socket/route/caller status from [bd.callbridge.service.BridgeSessionManager],
+     *  replacing the static placeholders set in [renderStaticStatus]. Minimal by design (brief:
+     *  "a StateFlow on the app singleton is fine") — calls-today/cost-today stay TODO. */
+    private fun observeBridgeStatus() {
+        val app = application as CallBridgeApp
+        lifecycleScope.launch {
+            app.bridgeSessionManager.status.collect { status ->
+                binding.textCaller.text = "Caller: ${status.callerNumber ?: "-"}"
+                binding.textSocket.text = "Socket: ${if (status.socketOpen) "open" else "not connected"} (${status.phase})"
+                binding.textRoute.text = "Injector route: ${status.injectorRoute ?: Config.injectorRoute} (native: ${runCatching { NativeBridge.nativeVersion() }.getOrDefault("n/a")})"
+                status.lastTranscriptLine?.let { binding.textState.text = "State: ${app.callController.state} — $it" }
+            }
+        }
     }
 
     private fun requestDefaultDialerRoleIfNeeded() {

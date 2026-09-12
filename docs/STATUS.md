@@ -12,8 +12,85 @@ Last updated: 2026-09-12 (M0 scaffold commit).
 | M1a — Capture | Code-complete, unit-tested (resampler THD/SNR, chunk-boundary continuity, VAD timing, mono→stereo). **Untested on a real device** — `AudioSource.VOICE_DOWNLINK`/`VOICE_CALL` need the priv-app install to actually initialize (`CAPTURE_AUDIO_OUTPUT`). |
 | M1b — Injection | Code-complete, unit-tested, **untested on a real device**. `TelephonyTxInjector` (Route B, the real primary path), `LoopbackInjector` (Route C), `InjectorFactory`, `TestTone`, and a `MixerControl` ALSA-ioctl helper are implemented. `IncallMusicInjector` (Route A) is a researched dead end — see `docs/injection-routes.md` — the HAL/mixer stanzas exist but no app-level mechanism (native ABI, hidden Java API) can reach `AUDIO_OUTPUT_FLAG_INCALL_MUSIC`; it always reports unavailable and falls through to B/C, matching spec's own "B → A → C" order. |
 | M2 — Bridge | Code-complete, unit-tested + live-smoke-tested against the real Gemini Live API. `GeminiLiveSession` (real OkHttp WebSocket client), `TranscriptRecorder`, `CostModel`, `SystemPromptBuilder` land in `gemini/`. Not yet wired to `audio/`/`Injector`/`service/` (that's M3). See [`docs/gemini-live.md`](./gemini-live.md). |
-| M3 — Polish | Pending. |
+| M3 — Wire-up | **Code-complete, unit-tested. Untested on a real device/call** — see below. |
 | M4 — Shop pilot | Pending. |
+
+## M3 — wire-up (this build)
+
+Composes capture -> Gemini Live -> injector into the active call. New files: `service/BridgeSession.kt`
+(the per-call composition object) and `service/BridgeSessionManager.kt` (the singleton that owns
+at most one `BridgeSession`, implements the new `call.CallSessionCoordinator` interface, and is
+`CallController`'s hook into all of this).
+
+**Decisions:**
+- **VAD mode: `VadMode.LOCAL_VAD`.** The audio pipeline's own `VadGate` (M1a) already exists
+  specifically to drive barge-in; `LOCAL_VAD` is what lets `sendActivityStart`/`sendActivityEnd`
+  and `interrupt()` actually do something (`GEMINI_VAD` makes `interrupt()` a no-op and gives no
+  manual turn boundary to hang a greeting off). No on-device A/B latency test between the two
+  modes has been run (needs a real call — see `docs/gemini-live.md`'s open item).
+- **Rates:** capture path needs no extra resampling before `sendAudio` — `AudioPipeline`/
+  `VoiceCallCapture` already emit `Config.CAPTURE_SAMPLE_RATE_HZ` (16 kHz) mono PCM16 in ~100 ms
+  chunks, which is exactly `LiveSession.sendAudio`'s contract. Gemini's `AudioOut` (24 kHz) is
+  resampled once, with a single per-call `Resampler(24000, 16000)` instance (kept stateful across
+  chunks for continuity), down to 16 kHz mono before `Injector.write()` — matches `Injector`'s
+  documented contract ("mono PCM16 input at `Config.CAPTURE_SAMPLE_RATE_HZ`"); `TelephonyTxInjector`
+  itself upmixes to stereo internally when it can open its preferred 16 kHz/stereo track.
+- **Greeting:** `LiveSession` has no "speak first"/text-turn API (session is audio-modality only).
+  Greeting = existing system-prompt instruction ("introduce yourself briefly at the start") +
+  an empty `activityStart`/`activityEnd` pair sent immediately after `setupComplete`, which under
+  manual VAD is the turn-boundary signal that makes the model generate its first response with
+  nothing said yet.
+- **Hangup mechanism (current, from M2):** `TranscriptRecorder.hangupRequested` (fuzzy match
+  against the spoken Bangla closing phrase in the ASR'd output transcript — the `[HANGUP]`-token
+  approach in spec §6 was superseded in M2, see `docs/gemini-live.md`). `BridgeSession` also treats
+  `LiveSession.terminalState` going `Failed` (watchdog/socket death) the same way — both paths call
+  back into `CallController.hangUp()` via an injected `onHangupRequested` lambda, never directly.
+- **Teardown:** `BridgeSession.stop(reason)` is idempotent (mutex-guarded `stopped` flag), cancels
+  the four/five collector jobs, then `injector.flush()+close()`, `liveSession.close()`,
+  `transcriptRecorder.finish(reason)` — each wrapped in `runCatching` so one failing step doesn't
+  skip the rest. `BridgeSessionManager` wraps `CallController`'s `onCallActive`/`onCallEnded`/
+  `onServiceDestroyed` callbacks in `runCatching` too (brief requirement: never crash the
+  InCallService).
+- **Status wiring:** `BridgeSessionManager.status: StateFlow<BridgeStatus>` (phase, caller number,
+  socket-open, injector route, last output-transcript line, end reason) — `StatusActivity` now
+  collects it in `onCreate` (`lifecycleScope`) instead of only rendering static placeholders.
+  Calls-today/cost-today stay TODO (need a `Flow` over `CallDao.observeCallsSince`/
+  `observeCostSince`, out of this milestone's scope).
+- **Logging:** tag `BridgeSession` — phase transitions (OPENING/ACTIVE/ENDING/ENDED), the
+  `RouteProbe` + (`TelephonyTxInjector`-specific) `getRoutedDevice()?.type` right after `open()`,
+  barge-in triggers, and the caller-`SpeechEnded` -> first-model-`AudioOut` round-trip in ms (the
+  <1.5s target from `docs/HANDOFF.md`'s next-steps list).
+- `CallController` gained one new optional constructor param, `sessionCoordinator:
+  CallSessionCoordinator?` (default null, so every existing M0/M1/M2 test/caller is unaffected),
+  and three call sites (`onTelecomCallActive`, `onCallRemoved`, `onServiceDestroyed`) that notify
+  it, each wrapped in `runCatching`. `CallStateMachine` was **not** touched — no new states needed.
+- `CallBridgeApp` wires `BridgeSessionManager` as `CallController`'s coordinator (constructed
+  first, `attach()`ed back to the controller after, since the manager also needs to call
+  `CallController.hangUp()`).
+
+**Tests** (`app/src/test/java/bd/callbridge/service/BridgeSessionTest.kt`, 7 tests, all against
+fakes — `FakeLiveSession`/`FakeInjector` plus the real `TranscriptRecorder` with the same in-memory
+DAO fakes `TranscriptRecorderTest` uses): AudioOut resample+write path, barge-in interrupt+flush
+(and the negative case — no interrupt when the model isn't speaking), hangup-phrase ->
+`onHangupRequested`, session-`Failed` -> `onHangupRequested`, idempotent `stop()`, and the greeting
+kick. `./gradlew testDebugUnitTest assembleDebug lint` all green (87 unit tests total, 0 failures).
+
+**Untested on device** (needs a real call — the actual milestone-deciding step, per
+`docs/HANDOFF.md`): whether `VoiceCallCapture` really gets caller audio, whether `TelephonyTxInjector`
+routes to `TYPE_TELEPHONY` and is actually audible on the far phone, the greeting-kick's real
+latency and whether the model reliably speaks first with it, and the caller-speech -> first-audio
+round-trip time against the <1.5s target. **Recommended on-device verification steps** (in order):
+1. Install the priv-app build, place a real call, confirm in logcat (`grep BridgeSession`) that
+   `phase=ACTIVE`, the `RouteProbe` line, and `routedDeviceType` appear.
+2. Confirm the greeting is heard first on the far phone within ~1-2s of pickup.
+3. Speak a farming question in Bangla; confirm a reply is heard, check the logged round-trip ms.
+4. While the model is replying, speak over it; confirm it stops (barge-in) and the caller is heard
+   again promptly.
+5. Say "না" / "শেষ করেন" after a reply's understanding-check question; confirm the model speaks the
+   closing phrase and the call actually hangs up (Telecom disconnects, `CallStateMachine` returns
+   to `IDLE`).
+6. Check the `turns` table (`calls`/`turns` in the Room DB) has plausible caller/assistant text and
+   a non-zero `estCostUsd` after the call ends.
 
 ## What M0 actually built
 
