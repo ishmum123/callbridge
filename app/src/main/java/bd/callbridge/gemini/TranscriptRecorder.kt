@@ -87,6 +87,11 @@ class TranscriptRecorder(
             is LiveSessionEvent.Error -> Unit
             LiveSessionEvent.SetupComplete -> Unit
             LiveSessionEvent.Closed -> flushTurn()
+            // Tool-call plumbing is handled by BridgeSession, not the transcript — nothing to
+            // record here (the caller's question/model's answer around the tool call still show
+            // up as ordinary Input/OutputTranscript deltas).
+            is LiveSessionEvent.ToolCall -> Unit
+            is LiveSessionEvent.ToolCallCancelled -> Unit
         }
     }
 

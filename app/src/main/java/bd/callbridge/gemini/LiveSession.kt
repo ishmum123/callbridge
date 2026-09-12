@@ -3,6 +3,7 @@ package bd.callbridge.gemini
 import bd.callbridge.Config
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.serialization.json.JsonObject
 
 /** A caller's profile injected into the system prompt (spec §6). */
 data class CallerProfile(
@@ -55,6 +56,20 @@ sealed interface LiveSessionEvent {
     data class Error(val message: String, val cause: Throwable? = null) : LiveSessionEvent
 
     data object Closed : LiveSessionEvent
+
+    /**
+     * Server invoked a declared function (`toolCall`, see `docs/gemini-tools.md`). [id] must be
+     * echoed back verbatim in [LiveSession.sendToolResponse]. [args] matches the function's
+     * declared `parameters` schema (e.g. `{"question": "..."}` for `lookup_health_info`).
+     */
+    data class ToolCall(val id: String, val name: String, val args: JsonObject) : LiveSessionEvent
+
+    /**
+     * Server withdrew one or more previously-issued [ToolCall]s (e.g. the caller barged in before
+     * we answered) — drop any in-flight lookup for these [ids] rather than sending a stale
+     * [LiveSession.sendToolResponse].
+     */
+    data class ToolCallCancelled(val ids: List<String>) : LiveSessionEvent
 }
 
 /**
@@ -110,6 +125,15 @@ interface LiveSession {
      */
     fun sendTextTurn(text: String)
 
+    /**
+     * Answers a server [LiveSessionEvent.ToolCall] (`docs/gemini-tools.md`). [id] and [name] must
+     * be the ones from the [LiveSessionEvent.ToolCall] being answered; [response] is a free-form
+     * JSON object the model reads as the function's result. Re-arms the response watchdog (see
+     * [GeminiLiveSession]'s class doc) so a model that never replies after a tool response is
+     * still caught.
+     */
+    suspend fun sendToolResponse(id: String, name: String, response: JsonObject)
+
     /** Count of audio chunks dropped so far because the outbound socket queue was too full. */
     val droppedAudioChunkCount: Long
 
@@ -152,6 +176,9 @@ class UnimplementedLiveSession : LiveSession {
         throw NotImplementedError("Use GeminiLiveSession for a real Live API connection.")
 
     override fun sendTextTurn(text: String): Nothing =
+        throw NotImplementedError("Use GeminiLiveSession for a real Live API connection.")
+
+    override suspend fun sendToolResponse(id: String, name: String, response: JsonObject): Nothing =
         throw NotImplementedError("Use GeminiLiveSession for a real Live API connection.")
 
     override val droppedAudioChunkCount: Long = 0L

@@ -13,6 +13,7 @@ import bd.callbridge.audio.VadGate
 import bd.callbridge.audio.VoiceCallCapture
 import bd.callbridge.gemini.ApiKeyAuth
 import bd.callbridge.gemini.CallerProfile
+import bd.callbridge.gemini.FunctionDeclaration
 import bd.callbridge.gemini.GeminiLiveSession
 import bd.callbridge.gemini.LiveSession
 import bd.callbridge.gemini.LiveSessionEvent
@@ -20,8 +21,11 @@ import bd.callbridge.gemini.SessionTerminalState
 import bd.callbridge.gemini.SystemPromptBuilder
 import bd.callbridge.gemini.TranscriptRecorder
 import bd.callbridge.gemini.VadMode
+import bd.callbridge.knowledge.HealthKnowledge
+import bd.callbridge.knowledge.noInformationAvailable
 import bd.callbridge.store.dao.CallDao
 import bd.callbridge.store.dao.TurnDao
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
@@ -41,6 +45,12 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.serialization.json.add
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.put
+import kotlinx.serialization.json.putJsonArray
 
 private const val TAG = "BridgeSession"
 
@@ -116,6 +126,16 @@ class BridgeSession(
      *  [Injector.write] — runs on this dispatcher rather than [scope]'s own (code review fix:
      *  a blocking AudioTrack/injector write must not tie up a shared Dispatchers.Default thread). */
     private val injectorDispatcher: CoroutineDispatcher = Dispatchers.IO,
+    /** Health-demo tool backend (`docs/gemini-tools.md`); null when this call's [systemPrompt]
+     *  declares no tools (e.g. the general shop-assistant persona), in which case no `ToolCall`
+     *  event should ever arrive, but see [handleToolCall]'s fallback if one somehow does. */
+    private val healthKnowledge: HealthKnowledge? = null,
+    /** Caller-profile context passed to [healthKnowledge]'s lookup, same summary already baked
+     *  into [systemPrompt] via `HealthPromptBn.healthSystemPrompt`. */
+    private val callerContextSummary: String? = null,
+    /** Dispatcher [handleToolCall]'s lookup job runs on — [Dispatchers.IO] in production (the
+     *  lookup itself does network I/O); overridable so tests can drive it deterministically. */
+    private val toolLookupDispatcher: CoroutineDispatcher = Dispatchers.IO,
 ) {
     private val teardownMutex = Mutex()
     @Volatile private var stopped = false
@@ -129,6 +149,11 @@ class BridgeSession(
 
     private val jobs = CopyOnWriteArrayList<Job>()
     private var startJob: Job? = null
+
+    /** Pending `lookup_health_info` lookups keyed by the `toolCall`'s id, so a
+     *  [LiveSessionEvent.ToolCallCancelled] can cancel + drop exactly the right one(s). See
+     *  [handleToolCall]/[handleToolCallCancelled]. */
+    private val pendingToolCalls = ConcurrentHashMap<String, Job>()
 
     private val resamplerCache = mutableMapOf<Pair<Int, Int>, Resampler>()
 
@@ -252,8 +277,85 @@ class BridgeSession(
 
             is LiveSessionEvent.OutputTranscript -> onStatus(currentStatusSnapshot(lastTranscriptLine = event.text))
 
+            is LiveSessionEvent.ToolCall -> handleToolCall(event)
+
+            is LiveSessionEvent.ToolCallCancelled -> handleToolCallCancelled(event)
+
             else -> Unit
         }
+    }
+
+    /**
+     * Handles a `lookup_health_info` [LiveSessionEvent.ToolCall]: runs [healthKnowledge]'s lookup
+     * in a tracked background [Job] (never inline in this collector — [handleLiveEvent] must keep
+     * draining audio/transcript events while a lookup, up to its own 6s budget, is in flight), then
+     * replies via [LiveSession.sendToolResponse]. If [healthKnowledge] is null (tool declared
+     * without a backend — shouldn't happen in production wiring, but must not leave the model
+     * hanging) or the function name is unrecognized, replies immediately with
+     * [noInformationAvailable] instead of silently dropping the call.
+     */
+    private fun handleToolCall(event: LiveSessionEvent.ToolCall) {
+        if (healthKnowledge == null || event.name != "lookup_health_info") {
+            Log.w(TAG, "ToolCall id=${event.id} name=${event.name}: no matching backend; replying with no-info")
+            val job = scope.launch(exceptionHandler) {
+                sendNoInfoResponse(event.id, event.name)
+            }
+            pendingToolCalls[event.id] = job
+            jobs += job
+            return
+        }
+
+        val question = event.args["question"]?.jsonPrimitive?.contentOrNull.orEmpty()
+        Log.i(TAG, "ToolCall received id=${event.id} name=${event.name} question=$question")
+        val job = scope.launch(exceptionHandler + toolLookupDispatcher) {
+            val startedAtMs = nowMs()
+            val answer = try {
+                healthKnowledge.lookup(question, callerContextSummary)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                // HealthKnowledge implementations document that they never throw, but the model
+                // must get *some* response even if that contract is violated — never leave a
+                // ToolCall unanswered.
+                Log.w(TAG, "ToolCall id=${event.id}: lookup threw unexpectedly", e)
+                noInformationAvailable()
+            }
+            val lookupMs = nowMs() - startedAtMs
+            // Atomically claim this id: if ToolCallCancelled already removed it, this returns
+            // null and we drop the result instead of sending a stale toolResponse.
+            if (pendingToolCalls.remove(event.id) == null) {
+                Log.i(TAG, "ToolCall id=${event.id}: cancelled before lookup finished (provider=${answer.provider} lookupMs=$lookupMs); dropping")
+                return@launch
+            }
+            Log.i(TAG, "ToolCall id=${event.id}: provider=${answer.provider} lookupMs=$lookupMs")
+            val response = buildJsonObject {
+                put("result", answer.answerEn)
+                putJsonArray("sources") { answer.sources.forEach { add(it) } }
+            }
+            runCatching { liveSession.sendToolResponse(event.id, event.name, response) }
+                .onSuccess { Log.i(TAG, "ToolCall id=${event.id}: response sent") }
+                .onFailure { Log.w(TAG, "ToolCall id=${event.id}: sendToolResponse failed", it) }
+        }
+        pendingToolCalls[event.id] = job
+        jobs += job
+    }
+
+    private suspend fun sendNoInfoResponse(id: String, name: String) {
+        if (pendingToolCalls.remove(id) == null) return
+        val fallback = noInformationAvailable()
+        val response = buildJsonObject {
+            put("result", fallback.answerEn)
+            putJsonArray("sources") { }
+        }
+        runCatching { liveSession.sendToolResponse(id, name, response) }
+            .onFailure { Log.w(TAG, "ToolCall id=$id: fallback sendToolResponse failed", it) }
+    }
+
+    /** Drops any pending lookup(s) for the cancelled ids without sending a (now stale)
+     *  [LiveSession.sendToolResponse] — see [pendingToolCalls]'s doc. */
+    private fun handleToolCallCancelled(event: LiveSessionEvent.ToolCallCancelled) {
+        Log.i(TAG, "ToolCallCancelled ids=${event.ids}")
+        event.ids.forEach { id -> pendingToolCalls.remove(id)?.cancel() }
     }
 
     /** Resamples on the calling (event-collector) dispatcher, but the actual [Injector.write] —
@@ -413,11 +515,19 @@ object BridgeSessionFactory {
         scope: CoroutineScope,
         onHangupRequested: suspend () -> Unit,
         onStatus: (BridgeStatus) -> Unit = {},
+        /** Tools declared for this call's Live session (`docs/gemini-tools.md`); empty for the
+         *  general shop-assistant persona. See [bd.callbridge.service.BridgeSessionManager]. */
+        tools: List<FunctionDeclaration> = emptyList(),
+        /** Health-demo tool backend; only meaningful (and only ever called) when [tools] declares
+         *  `lookup_health_info`. */
+        healthKnowledge: bd.callbridge.knowledge.HealthKnowledge? = null,
+        callerContextSummary: String? = null,
     ): BridgeSession {
         val vadMode = VadMode.LOCAL_VAD
         val liveSession = GeminiLiveSession(
             authProvider = ApiKeyAuth(Config.geminiApiKey),
             vadMode = vadMode,
+            tools = tools,
         )
         val injector = InjectorFactory.create(Config.injectorRoute, context)
         val capture = VoiceCallCapture(context)
@@ -439,6 +549,8 @@ object BridgeSessionFactory {
             scope = scope,
             onHangupRequested = onHangupRequested,
             onStatus = onStatus,
+            healthKnowledge = healthKnowledge,
+            callerContextSummary = callerContextSummary,
         )
     }
 }

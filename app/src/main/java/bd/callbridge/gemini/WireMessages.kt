@@ -1,5 +1,6 @@
 package bd.callbridge.gemini
 
+import kotlinx.serialization.EncodeDefault
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.JsonObject
 
@@ -25,6 +26,29 @@ data class SetupConfig(
     val inputAudioTranscription: JsonObject = JsonObject(emptyMap()),
     val outputAudioTranscription: JsonObject = JsonObject(emptyMap()),
     val realtimeInputConfig: RealtimeInputConfig? = null,
+    /**
+     * Function-calling tools declared for this session (`docs/gemini-tools.md`). Omitted from the
+     * wire message entirely when empty (`@EncodeDefault(NEVER)` overrides the class's own
+     * `encodeDefaults = true`) so sessions that don't need tools send exactly the same setup shape
+     * as before this field existed.
+     */
+    @EncodeDefault(EncodeDefault.Mode.NEVER) val tools: List<Tool> = emptyList(),
+)
+
+/** One group of function declarations in a `setup.tools[]` entry (spec: `docs/gemini-tools.md`). */
+@Serializable
+data class Tool(val functionDeclarations: List<FunctionDeclaration>)
+
+/**
+ * One callable function the model may invoke via a server `toolCall` message. [parameters] is a
+ * JSON-Schema-shaped object (`{"type":"object","properties":{...},"required":[...]}`) — modeled as
+ * a raw [JsonObject] rather than a strict class since the schema shape varies per function.
+ */
+@Serializable
+data class FunctionDeclaration(
+    val name: String,
+    val description: String,
+    val parameters: JsonObject,
 )
 
 @Serializable
@@ -98,3 +122,17 @@ data class ClientTurn(val role: String, val parts: List<Part>)
 
 /** mimeType for 16 kHz PCM16 audio we send to the Live API (spec §4.4). */
 const val INPUT_AUDIO_MIME_TYPE = "audio/pcm;rate=16000"
+
+/**
+ * Client -> server reply to a server `toolCall` (`docs/gemini-tools.md`). [id] and [name] must
+ * echo the values from the `toolCall.functionCalls[]` entry being answered; [response] is a
+ * free-form JSON object (e.g. `{"result": "...", "sources": [...]}`).
+ */
+@Serializable
+data class ToolResponseEnvelope(val toolResponse: ToolResponsePayload)
+
+@Serializable
+data class ToolResponsePayload(val functionResponses: List<FunctionResponse>)
+
+@Serializable
+data class FunctionResponse(val id: String, val name: String, val response: JsonObject)
