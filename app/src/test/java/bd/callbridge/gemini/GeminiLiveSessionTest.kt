@@ -130,7 +130,8 @@ class GeminiLiveSessionTest {
         assertTrue(setup.containsKey("outputAudioTranscription"))
         val rtc = setup["realtimeInputConfig"]!!.jsonObject
         assertEquals(true, rtc["automaticActivityDetection"]!!.jsonObject["disabled"]!!.jsonPrimitive.content.toBoolean())
-        assertEquals("START_OF_ACTIVITY_INTERRUPTS", rtc["activityHandling"]!!.jsonPrimitive.content)
+        val expectedHandling = if (bd.callbridge.Config.HALF_DUPLEX) "NO_INTERRUPTION" else "START_OF_ACTIVITY_INTERRUPTS"
+        assertEquals(expectedHandling, rtc["activityHandling"]!!.jsonPrimitive.content)
 
         session.close()
     }
