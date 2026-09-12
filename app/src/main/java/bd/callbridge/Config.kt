@@ -9,9 +9,10 @@ import bd.callbridge.audio.InjectorRoute
  */
 object Config {
     /** Selects which [bd.callbridge.audio.Injector] implementation BridgeForegroundService wires up.
-     *  M1b (injection worker) flips this once Route A/B is proven on-device; defaults to NOOP so
-     *  the app runs end-to-end on a plain (non-rooted) build without crashing. */
-    val injectorRoute: InjectorRoute = InjectorRoute.NOOP
+     *  Route B (TELEPHONY_TX) proven on-device 2026-09-12: tone injected via AudioTrack preferred
+     *  device TYPE_TELEPHONY was heard on the far phone (see docs/injection-routes.md). Set NOOP
+     *  for a plain non-rooted build. */
+    val injectorRoute: InjectorRoute = InjectorRoute.TELEPHONY_TX
 
     /** Verified Gemini Live model ids (2026-09-12). [GEMINI_MODEL_ID] is the primary model the
      *  Gemini-session worker (M2) should open; [GEMINI_MODEL_FALLBACK] is used if the primary

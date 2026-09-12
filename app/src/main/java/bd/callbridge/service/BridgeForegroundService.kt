@@ -98,5 +98,12 @@ class BridgeForegroundService : Service() {
             val intent = Intent(context, BridgeForegroundService::class.java)
             context.startForegroundService(intent)
         }
+
+        /** M3: stop the foreground service once a [bd.callbridge.service.BridgeSession] ends
+         *  (minor review finding: it was never stopped, so the wake/Wi-Fi locks and the ongoing
+         *  notification outlived every call). Safe to call even if it was never started. */
+        fun stop(context: Context) {
+            context.stopService(Intent(context, BridgeForegroundService::class.java))
+        }
     }
 }

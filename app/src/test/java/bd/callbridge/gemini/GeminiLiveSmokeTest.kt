@@ -56,6 +56,64 @@ class GeminiLiveSmokeTest {
         println("LIVE SMOKE TEST: model=${result.first} events=${result.second}")
     }
 
+    /**
+     * B2 verification (M3 review): the greeting kick sends a text `clientContent` turn instead
+     * of an empty activityStart/activityEnd pair (which armed the 8s response watchdog on every
+     * call). Opens a real session, sends the same Bangla greeting-trigger text BridgeSession
+     * sends, and asserts at least one [LiveSessionEvent.AudioOut] and a
+     * [LiveSessionEvent.TurnComplete] arrive within ~8s — i.e. the model actually answers a text
+     * turn in an audio-output session, and doing so doesn't trip the watchdog.
+     */
+    @Test
+    fun `real session accepts a text turn (greeting kick) and replies with audio within 8s`() = runBlocking {
+        assumeTrue(
+            "liveSmoke system property not set to true; skipping (see docs/gemini-live.md for the -PliveSmoke=true command)",
+            System.getProperty("liveSmoke") == "true",
+        )
+        val apiKey = readApiKey()
+        assumeTrue("GEMINI_API_KEY not present in local.properties; skipping live smoke test", apiKey != null)
+
+        val client = OkHttpClient.Builder().readTimeout(0, TimeUnit.MILLISECONDS).build()
+        val session = GeminiLiveSession(
+            authProvider = ApiKeyAuth(apiKey!!),
+            modelId = bd.callbridge.Config.GEMINI_MODEL_ID,
+            vadMode = VadMode.LOCAL_VAD,
+            client = client,
+            scope = CoroutineScope(SupervisorJob() + Dispatchers.Default),
+            setupTimeoutMs = 10_000L,
+            // Production default (8s): this is exactly the value B2 needs verified against —
+            // sendTextTurn must not arm this and the model's reply must land well inside it.
+        )
+        val profile = CallerProfile(number = "01700000000", name = null, village = null, occupation = null)
+        val events = mutableListOf<LiveSessionEvent>()
+        val collectJob = launch { session.events.collect { events.add(it) } }
+
+        try {
+            session.open("তুমি একটি সহায়ক ফোন সেবা। কেউ কল করলে সংক্ষেপে বাংলায় নিজের পরিচয় দাও।", profile)
+            session.sendTextTurn("কল শুরু হয়েছে, নিজের পরিচয় দাও।")
+
+            val gotAudioAndTurnComplete = withTimeoutOrNull(8_000L) {
+                while (events.none { it is LiveSessionEvent.AudioOut } || events.none { it is LiveSessionEvent.TurnComplete }) {
+                    delay(50)
+                }
+                true
+            }
+
+            val summary = events.map { it.javaClass.simpleName }
+            println("GREETING SMOKE TEST: withinBudget=$gotAudioAndTurnComplete events=$summary")
+
+            check(gotAudioAndTurnComplete == true) {
+                "Expected AudioOut + TurnComplete within 8s of sending the greeting text turn; got $summary"
+            }
+            check(events.none { it is LiveSessionEvent.Error }) {
+                "Expected no Error event; got $summary"
+            }
+        } finally {
+            collectJob.cancel()
+            runCatching { session.close() }
+        }
+    }
+
     /** Returns (modelId, eventSummaries) on success, or null if setup/open failed for this model. */
     private suspend fun tryModel(client: OkHttpClient, apiKey: String, modelId: String): Pair<String, List<String>>? = coroutineScope {
         val session = GeminiLiveSession(

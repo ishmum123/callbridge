@@ -24,6 +24,9 @@ import android.util.Log
 class TelephonyTxInjector(private val context: Context) : Injector {
     override val route: InjectorRoute = InjectorRoute.TELEPHONY_TX
 
+    override val openSampleRateHz: Int?
+        get() = track?.let { if (stereo) PREFERRED_SAMPLE_RATE_HZ else FALLBACK_SAMPLE_RATE_HZ }
+
     private val audioManager: AudioManager by lazy {
         context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
     }
