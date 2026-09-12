@@ -92,6 +92,70 @@ round-trip time against the <1.5s target. **Recommended on-device verification s
 6. Check the `turns` table (`calls`/`turns` in the Room DB) has plausible caller/assistant text and
    a non-zero `estCostUsd` after the call ends.
 
+## M3 — Opus code-review fixes (this build, on top of the initial M3 commit)
+
+An Opus review of the first M3 commit found 2 blockers + 9 majors, all fixed here (13 unit tests
+in `BridgeSessionTest`, up from 7; full findings/verdicts in the PR/commit history):
+
+- **B1 (double hangup + leaked job):** `requestHangup` now computes `shouldHangUp` inside the
+  mutex and only calls `onHangupRequested()` when true (was: `return@withLock` only skipped the
+  lambda, not the call after it) — closing-phrase + terminal-`Failed` racing each other now call
+  `onHangupRequested` exactly once. Its launched job is tracked in `jobs` so `stop()` cancels/joins
+  it too, instead of it surviving to potentially disconnect a later call.
+- **B2 (greeting armed the watchdog):** replaced the empty `activityStart`/`activityEnd` greeting
+  kick with `LiveSession.sendTextTurn(text)` (new: `WireMessages.ClientContentEnvelope`,
+  implemented in `GeminiLiveSession`, deliberately never arms the response watchdog). **Verified
+  live** against the real Gemini Live API in `GeminiLiveSmokeTest` (`-PliveSmoke=true`): sending the
+  Bangla greeting trigger produced `AudioOut` + `TurnComplete` within the 8s budget, no `Error`
+  event — see that test's `system-out` for the actual event sequence.
+- **M1 (ordering):** `AudioPipeline` gained a single ordered `events: Flow<PipelineEvent>` (sealed
+  `Chunk`/`Vad`); `chunks` is now derived from it. `BridgeSession` consumes only `events` in one
+  coroutine, so `sendActivityStart`/`sendAudio`/`sendActivityEnd` happen in strict encounter order
+  — the tail-flush chunk is now emitted *before* the `SpeechEnded` event that would otherwise race
+  it. `vadEvents`/`chunks` stay as separate flows too, for M1a's own tests.
+- **M2 (rate mismatch):** `Injector` gained `openSampleRateHz: Int?` (negotiated post-`open()`,
+  e.g. `TelephonyTxInjector`'s 16kHz-stereo-or-8kHz-mono fallback). The output resampler is now
+  built from `injector.openSampleRateHz`, not a hardcoded 16kHz, and cached per (inputRate,
+  outputRate) pair (m6) instead of rebuilt per chunk.
+- **M3 (stale audio):** a `suppressStaleAudio` flag, set on barge-in and cleared on
+  `Interrupted`/`TurnComplete`, drops any further `AudioOut` frames from the turn that was just
+  barged into.
+- **M4 (teardown ordering):** `stop()` now cancels `startJob` + every collector job and **joins**
+  them (`joinAll()`) before touching `injector`/`liveSession`, instead of firing cancellation and
+  immediately closing shared resources those jobs might still be mid-write on.
+- **M5 (drain logic):** the closing-phrase hangup path now waits (`withTimeoutOrNull`) for the next
+  `TurnComplete`/`Interrupted` on `liveSession.events` — not a fixed sleep, and not on the first
+  transcript delta that happens to contain the phrase — before hanging up, so the model's spoken
+  goodbye finishes. `stop()` itself no longer has any artificial delay.
+- **M6 (BridgeSessionManager races):** `BridgeSession.start()` now returns promptly (`open()` runs
+  in a background job the session owns), so `BridgeSessionManager` assigns `currentSession` before
+  calling `start()` rather than after it returns, and never holds `sessionMutex` across the network
+  open. `BridgeSession.stop()` cancels the in-flight open job directly instead of waiting out a 10s
+  setup timeout. A `pendingJob` in the manager covers the last sliver (call ending during the
+  local/DB work in `buildSession`, before `currentSession` is even assigned).
+- **M7 (subscribe-before-open):** `liveSession.events`/`terminalState` collectors are now launched
+  before `liveSession.open()` is called, matching `LiveSession.open`'s documented contract.
+- **M8 (blocking write):** `Injector.write()` runs inside `withContext(Dispatchers.IO)`, not on the
+  shared event-collector dispatcher.
+- **M9 (duplicate activityStart):** barge-in now only calls `interrupt()` (which itself sends the
+  manual activityStart under `LOCAL_VAD`) — it no longer also calls `sendActivityStart()` directly.
+- **Minors:** mutable cross-coroutine flags are `@Volatile`; `BridgeSessionManager` now passes the
+  real call direction (`isOutgoing`) instead of hardcoding `INBOUND`; `StatusActivity` uses
+  `repeatOnLifecycle(STARTED)` and always updates the phase text, not just when a transcript line
+  arrives.
+- **Declined, with reasons:**
+  - *"Stop `BridgeForegroundService` when the session ends"* — not done. That service is
+    started at boot / from `StatusActivity` specifically to keep the CPU/Wi-Fi awake so the *next*
+    call can be answered; stopping it after every call would drop that between calls, which looks
+    like a regression, not a fix. Left `BridgeForegroundService.stop()` available as a utility but
+    unused.
+  - *"Default `Config.injectorRoute` to `TELEPHONY_TX`, Route B is confirmed routable on-device"* —
+    not done. `docs/HANDOFF.md` (same day) is explicit that Route B is **not yet proven on a real
+    device** ("the milestone-deciding test, nobody has run it yet"); flipping the default and
+    documenting it as "confirmed" would assert live-state nobody here has actually probed. Left
+    `Config.injectorRoute = NOOP`; flip it once the on-device test in `docs/HANDOFF.md`/this file's
+    verification steps above has actually been run.
+
 ## What M0 actually built
 
 - Android project skeleton: Gradle Kotlin DSL, version catalog (`gradle/libs.versions.toml`), single `app` module, Gradle wrapper committed (pinned to Gradle 8.14.3 / AGP 8.13.0 / Kotlin 2.0.21).

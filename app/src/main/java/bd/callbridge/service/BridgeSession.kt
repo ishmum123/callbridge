@@ -17,24 +17,30 @@ import bd.callbridge.gemini.GeminiLiveSession
 import bd.callbridge.gemini.LiveSession
 import bd.callbridge.gemini.LiveSessionEvent
 import bd.callbridge.gemini.SessionTerminalState
+import bd.callbridge.gemini.SystemPromptBuilder
 import bd.callbridge.gemini.TranscriptRecorder
 import bd.callbridge.gemini.VadMode
 import bd.callbridge.store.dao.CallDao
 import bd.callbridge.store.dao.TurnDao
+import java.util.concurrent.CopyOnWriteArrayList
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.flow.Flow
-import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.launchIn
 import kotlinx.coroutines.flow.onEach
+import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.plus
 import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 
 private const val TAG = "BridgeSession"
 
@@ -54,37 +60,44 @@ data class BridgeStatus(
 /**
  * Per-call composition of capture -> Gemini Live -> injector (M3, spec §4.4 "wiring").
  *
- * Takes already-built [audioChunks]/[vadEvents] flows (normally [AudioPipeline.chunks] /
- * [AudioPipeline.vadEvents]) rather than an [AudioPipeline] instance directly, so unit tests can
- * drive this class with plain fake flows instead of standing up a real [VoiceCallCapture].
- * Collecting [audioChunks] is what starts/stops the underlying capture (see [AudioPipeline]'s own
- * doc comment) — cancelling the collector job in [stop] is enough to tear capture down too.
+ * Takes an already-built, single ordered [pipelineEvents] flow (normally
+ * [AudioPipeline.events]) rather than an [AudioPipeline] instance directly, so unit tests can
+ * drive this class with a plain fake flow instead of standing up a real [VoiceCallCapture].
+ * Collecting [pipelineEvents] is what starts/stops the underlying capture (see [AudioPipeline]'s
+ * own doc comment) — cancelling the collector job in [stop] is enough to tear capture down too.
+ *
+ * **Ordering (code review fix):** audio chunks and VAD transitions are consumed from the single
+ * [pipelineEvents] flow, in one coroutine, in strict production order — not as two independently
+ * scheduled flows (the original design), which could let `sendActivityStart` race ahead of/behind
+ * the audio it's supposed to bracket.
  *
  * VAD mode decision (stated per M3 brief): [VadMode.LOCAL_VAD]. The audio pipeline's own
  * [VadGate] already exists for barge-in and drives [LiveSession.sendActivityStart]/
  * [LiveSession.sendActivityEnd] here; [VadMode.GEMINI_VAD] would make [LiveSession.interrupt] a
- * no-op and give us no manual turn boundary to hang a greeting kick off (see [start]).
+ * no-op.
  *
- * Greeting decision: [LiveSession] has no "speak first" / text-turn API (the Live session here is
- * audio-modality only — see `docs/gemini-live.md`), so the greeting is produced by combining (a)
- * the existing system-prompt instruction ("শুরুতে সংক্ষেপে নিজের পরিচয় দাও...", i.e. "introduce
- * yourself briefly at the start") with (b) an immediate empty `activityStart`+`activityEnd` pair
- * sent right after `setupComplete`, which under manual VAD is exactly the turn-boundary signal
- * that prompts the model to generate its first response with nothing said yet.
+ * Greeting decision (code review fix): [LiveSession.sendTextTurn] sends a short Bangla text
+ * instruction right after `setupComplete`, instead of the original empty
+ * `activityStart`/`activityEnd` pair — that empty pair armed [GeminiLiveSession]'s 8s response
+ * watchdog, which would fail the call 8s after every pickup if the model didn't answer an empty
+ * turn. `sendTextTurn` deliberately never arms that watchdog (see its doc comment); verified live
+ * against the real API in `GeminiLiveSmokeTest` (see `docs/gemini-live.md`).
  *
  * Hangup mechanism: [TranscriptRecorder.hangupRequested] (fuzzy match against
  * [bd.callbridge.gemini.SystemPromptBuilder.HANGUP_PHRASE] in the ASR'd output transcript — see
- * `docs/gemini-live.md` "HANGUP token" section, current mechanism as of M2) drains briefly to let
- * any already-buffered reply audio finish reaching the injector, then calls [onHangupRequested].
+ * `docs/gemini-live.md` "HANGUP token" section, current mechanism as of M2) **drains until the
+ * model's turn actually completes** (or [drainTimeoutMs] elapses) before calling
+ * [onHangupRequested] — code review fix: the original fixed-sleep drain could still cut the
+ * goodbye off mid-sentence, or fire on the very first streaming transcript delta that happened to
+ * contain the phrase, well before the matching audio had even been generated.
  * [LiveSession.terminalState] going [SessionTerminalState.Failed] (watchdog/socket death) also
- * calls [onHangupRequested], per spec's watchdog behavior of ending the call gracefully.
+ * calls [onHangupRequested] (no drain — there's nothing left to finish).
  */
 class BridgeSession(
     private val liveSession: LiveSession,
     private val injector: Injector,
     private val transcriptRecorder: TranscriptRecorder,
-    private val audioChunks: Flow<ShortArray>,
-    private val vadEvents: Flow<VadGate.Event>,
+    private val pipelineEvents: Flow<AudioPipeline.PipelineEvent>,
     private val systemPrompt: String,
     private val callerProfile: CallerProfile,
     private val vadMode: VadMode,
@@ -94,21 +107,30 @@ class BridgeSession(
      *  ordering if it wants to; BridgeSession itself never blocks on it. */
     private val onHangupRequested: suspend () -> Unit,
     private val onStatus: (BridgeStatus) -> Unit = {},
-    private val outputResampler: Resampler = Resampler(Config.GEMINI_OUTPUT_SAMPLE_RATE_HZ, Config.CAPTURE_SAMPLE_RATE_HZ),
     private val nowMs: () -> Long = System::currentTimeMillis,
-    /** How long [stop] waits for already-in-flight reply audio to reach the injector before
-     *  tearing down when ending because of a hangup request (not a hard failure). */
-    private val drainTimeoutMs: Long = 1_500L,
+    /** How long to wait for the model's current turn to actually finish (goodbye audio) before
+     *  hanging up anyway, and (separately) how long [open] is allowed to take before [start]
+     *  gives up. */
+    private val drainTimeoutMs: Long = 4_000L,
+    /** [LiveSessionEvent.AudioOut] handling — including the potentially-blocking
+     *  [Injector.write] — runs on this dispatcher rather than [scope]'s own (code review fix:
+     *  a blocking AudioTrack/injector write must not tie up a shared Dispatchers.Default thread). */
+    private val injectorDispatcher: CoroutineDispatcher = Dispatchers.IO,
 ) {
     private val teardownMutex = Mutex()
-    private var stopped = false
-    private var hungUpTriggered = false
+    @Volatile private var stopped = false
+    @Volatile private var hungUpTriggered = false
+    @Volatile private var sessionActive = false
 
-    private var isModelSpeaking = false
-    private var lastSpeechEndedAtMs: Long? = null
-    private var firstAudioLogged = false
+    @Volatile private var isModelSpeaking = false
+    @Volatile private var suppressStaleAudio = false
+    @Volatile private var lastSpeechEndedAtMs: Long? = null
+    @Volatile private var firstAudioLogged = false
 
-    private var jobs = mutableListOf<Job>()
+    private val jobs = CopyOnWriteArrayList<Job>()
+    private var startJob: Job? = null
+
+    private val resamplerCache = mutableMapOf<Pair<Int, Int>, Resampler>()
 
     /** Every launched child coroutine goes through this so a bug in one collector (a fake/real
      *  dependency throwing, a malformed event) logs and dies quietly instead of taking down the
@@ -117,40 +139,37 @@ class BridgeSession(
         Log.e(TAG, "Unhandled exception in BridgeSession coroutine ($context)", throwable)
     }
 
-    /** Opens the Gemini session, starts capture/injection, and wires barge-in + hangup. Must be
-     *  called at most once. */
-    suspend fun start() {
+    /**
+     * Opens the Gemini session, starts capture/injection, and wires barge-in + hangup. Must be
+     * called at most once. Returns promptly — the actual [LiveSession.open] network call (and
+     * everything that depends on it) runs in a background job (code review fix: this lets a
+     * caller assign this session as "the active one" and call [stop] concurrently without ever
+     * blocking on or racing a slow/hanging `open()`; [stop] cancels that job directly rather than
+     * waiting out a 10s setup timeout).
+     */
+    fun start() {
+        if (stopped) {
+            Log.i(TAG, "start() called after stop(); ignoring")
+            return
+        }
         Log.i(TAG, "phase=OPENING caller=${callerProfile.number} vadMode=$vadMode")
         onStatus(BridgeStatus(phase = BridgePhase.OPENING, callerNumber = callerProfile.number))
 
-        injector.open()
-        logRouteProbe()
-
         try {
-            liveSession.open(systemPrompt, callerProfile)
+            injector.open()
+            logRouteProbe()
         } catch (e: Exception) {
-            Log.e(TAG, "LiveSession.open failed; hanging up", e)
-            scope.launch(exceptionHandler) { onHangupRequested() }
+            Log.e(TAG, "injector.open() failed; hanging up", e)
+            requestHangup("injector open failed: ${e.message}")
             return
         }
-        Log.i(TAG, "phase=ACTIVE caller=${callerProfile.number} socket=open")
-        onStatus(
-            BridgeStatus(
-                phase = BridgePhase.ACTIVE,
-                callerNumber = callerProfile.number,
-                socketOpen = true,
-                injectorRoute = injector.route.name,
-            )
-        )
 
-        jobs += liveSession.events.onEach { handleLiveEvent(it) }.launchIn(scope + exceptionHandler)
+        // Subscribe to liveSession.events/terminalState BEFORE open() (LiveSession's documented
+        // contract: events has no replay, so a setup-failure Error emitted during open() itself
+        // would be missed by a subscriber that attaches afterwards — code review fix, this was
+        // previously done after open() returned).
         jobs += liveSession.events.onEach { transcriptRecorder.handle(it) }.launchIn(scope + exceptionHandler)
-        jobs += vadEvents.onEach { handleVadEvent(it) }.launchIn(scope + exceptionHandler)
-        jobs += audioChunks.onEach { chunk ->
-            liveSession.sendAudio(chunk)
-            transcriptRecorder.onAudioSent(chunk)
-        }.launchIn(scope + exceptionHandler)
-        jobs += transcriptRecorder.hangupRequested.onEach { requestHangup("model closing phrase") }.launchIn(scope + exceptionHandler)
+        jobs += liveSession.events.onEach { handleLiveEvent(it) }.launchIn(scope + exceptionHandler)
         jobs += liveSession.terminalState.onEach { terminal ->
             if (terminal is SessionTerminalState.Failed) {
                 Log.w(TAG, "LiveSession terminal Failed: ${terminal.message}", terminal.cause)
@@ -158,20 +177,60 @@ class BridgeSession(
                 requestHangup("session failed: ${terminal.message}")
             }
         }.launchIn(scope + exceptionHandler)
+        jobs += transcriptRecorder.hangupRequested.onEach { onHangupPhraseDetected() }.launchIn(scope + exceptionHandler)
 
-        // Greeting kick (see class doc): an empty activityStart/activityEnd pair immediately
-        // after setup, so the model's first turn is generated with nothing said yet — the system
-        // prompt already instructs it to introduce itself in that first turn.
-        if (vadMode == VadMode.LOCAL_VAD) {
-            Log.i(TAG, "sending greeting kick (empty activityStart/activityEnd)")
-            liveSession.sendActivityStart()
-            liveSession.sendActivityEnd()
+        startJob = scope.launch(exceptionHandler) {
+            try {
+                liveSession.open(systemPrompt, callerProfile)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.e(TAG, "LiveSession.open failed; hanging up", e)
+                requestHangup("open failed: ${e.message}")
+                return@launch
+            }
+            if (stopped) {
+                // stop() raced us while open() was in flight and won; nothing left to do here —
+                // stop()'s own teardown already (or will) close what open() just stood up.
+                return@launch
+            }
+            sessionActive = true
+            Log.i(TAG, "phase=ACTIVE caller=${callerProfile.number} socket=open")
+            onStatus(currentStatusSnapshot(phase = BridgePhase.ACTIVE))
+
+            jobs += pipelineEvents.onEach { handlePipelineEvent(it) }.launchIn(scope + exceptionHandler)
+
+            // Greeting kick (see class doc): a text turn instructing the model to introduce
+            // itself, since the audio-output session has no other "speak first" mechanism.
+            Log.i(TAG, "sending greeting kick (text turn)")
+            liveSession.sendTextTurn(SystemPromptBuilder.GREETING_TRIGGER)
         }
     }
 
-    private fun handleLiveEvent(event: LiveSessionEvent) {
+    /** Single ordered consumer for both gated audio chunks and VAD transitions (see class doc's
+     *  "Ordering" note) — this is what guarantees `sendActivityStart`/`sendAudio`/
+     *  `sendActivityEnd` happen in encounter order. */
+    private fun handlePipelineEvent(event: AudioPipeline.PipelineEvent) {
+        when (event) {
+            is AudioPipeline.PipelineEvent.Chunk -> {
+                liveSession.sendAudio(event.pcm)
+                transcriptRecorder.onAudioSent(event.pcm)
+            }
+            is AudioPipeline.PipelineEvent.Vad -> handleVadEvent(event.event)
+        }
+    }
+
+    private suspend fun handleLiveEvent(event: LiveSessionEvent) {
         when (event) {
             is LiveSessionEvent.AudioOut -> {
+                if (!sessionActive) return
+                if (suppressStaleAudio) {
+                    // Stale audio from a turn we already barged into; wait for
+                    // Interrupted/TurnComplete before writing anything else to the injector
+                    // (code review fix — previously flush() cleared what was already queued but
+                    // kept writing every subsequent frame of the interrupted turn).
+                    return
+                }
                 if (!isModelSpeaking) {
                     isModelSpeaking = true
                     val speechEndedAt = lastSpeechEndedAtMs
@@ -180,20 +239,12 @@ class BridgeSession(
                         Log.i(TAG, "round-trip caller-SpeechEnded -> first model audio: ${nowMs() - speechEndedAt}ms")
                     }
                 }
-                val resampler = if (event.sampleRate == Config.GEMINI_OUTPUT_SAMPLE_RATE_HZ) {
-                    outputResampler
-                } else {
-                    // A model/rate change from the documented 24 kHz would silently mis-resample
-                    // with a fixed-ratio resampler built for 24->16; log loudly rather than guess.
-                    Log.w(TAG, "AudioOut sampleRate=${event.sampleRate}, expected ${Config.GEMINI_OUTPUT_SAMPLE_RATE_HZ}; resampling anyway with a fresh one-shot resampler")
-                    Resampler(event.sampleRate, Config.CAPTURE_SAMPLE_RATE_HZ)
-                }
-                val resampled = resampler.process(event.pcm)
-                if (resampled.isNotEmpty()) injector.write(resampled)
+                writeToInjector(event)
             }
 
             LiveSessionEvent.TurnComplete, LiveSessionEvent.Interrupted -> {
                 isModelSpeaking = false
+                suppressStaleAudio = false
                 firstAudioLogged = false
             }
 
@@ -205,6 +256,27 @@ class BridgeSession(
         }
     }
 
+    /** Resamples on the calling (event-collector) dispatcher, but the actual [Injector.write] —
+     *  potentially a blocking `AudioTrack.write` call — runs on [injectorDispatcher] (code review
+     *  fix: must not tie up a shared `Dispatchers.Default` thread). A narrow [withContext] around
+     *  just the write, rather than moving the whole event-collector job to a different
+     *  dispatcher, keeps this single-flow collector's ordering guarantees simple to reason about. */
+    private suspend fun writeToInjector(event: LiveSessionEvent.AudioOut) {
+        // Resample to the injector's actually-negotiated rate, not a fixed assumption (code
+        // review fix): TelephonyTxInjector can fall back to 8 kHz mono, and writing 16kHz-rate
+        // samples to an 8kHz track plays back at half speed / garbled.
+        val targetRate = injector.openSampleRateHz ?: Config.CAPTURE_SAMPLE_RATE_HZ
+        if (event.sampleRate != Config.GEMINI_OUTPUT_SAMPLE_RATE_HZ) {
+            Log.w(TAG, "AudioOut sampleRate=${event.sampleRate}, expected ${Config.GEMINI_OUTPUT_SAMPLE_RATE_HZ}; resampling anyway")
+        }
+        val resampler = resamplerCache.getOrPut(event.sampleRate to targetRate) {
+            Log.i(TAG, "building resampler ${event.sampleRate}Hz -> ${targetRate}Hz (injector.openSampleRateHz=${injector.openSampleRateHz})")
+            Resampler(event.sampleRate, targetRate)
+        }
+        val resampled = resampler.process(event.pcm)
+        if (resampled.isNotEmpty()) withContext(injectorDispatcher) { injector.write(resampled) }
+    }
+
     private fun handleVadEvent(event: VadGate.Event) {
         when (event) {
             VadGate.Event.SpeechStarted -> {
@@ -212,11 +284,16 @@ class BridgeSession(
                 firstAudioLogged = false
                 if (isModelSpeaking) {
                     Log.i(TAG, "barge-in: caller speech while model speaking -> interrupt()+flush()")
+                    // interrupt() already sends the manual activityStart signal under
+                    // LOCAL_VAD (see LiveSession.interrupt's doc) — do not also call
+                    // sendActivityStart() below, or the server sees it twice (code review fix).
                     liveSession.interrupt()
                     injector.flush()
+                    suppressStaleAudio = true
                     isModelSpeaking = false
+                } else if (vadMode == VadMode.LOCAL_VAD) {
+                    liveSession.sendActivityStart()
                 }
-                if (vadMode == VadMode.LOCAL_VAD) liveSession.sendActivityStart()
             }
 
             VadGate.Event.SpeechEnded -> {
@@ -226,35 +303,67 @@ class BridgeSession(
         }
     }
 
-    private fun requestHangup(reason: String) {
+    /** The ASR'd output transcript matched the closing phrase. Drains until the model's turn
+     *  actually completes (its goodbye audio has fully streamed) or [drainTimeoutMs] elapses,
+     *  *then* hangs up — never on the first transcript delta that happens to contain the phrase
+     *  (code review fix: that could cut the goodbye off mid-sentence, since the delta arrives
+     *  well before the matching audio is done generating). */
+    private fun onHangupPhraseDetected() {
         scope.launch(exceptionHandler) {
-            teardownMutex.withLock {
-                if (hungUpTriggered) return@withLock
-                hungUpTriggered = true
-                Log.i(TAG, "phase=ENDING reason=$reason")
-                onStatus(currentStatusSnapshot(phase = BridgePhase.ENDING, endReason = reason))
+            Log.i(TAG, "hangup phrase detected in transcript; draining until TurnComplete or ${drainTimeoutMs}ms")
+            // A fresh subscription to liveSession.events (not a side-channel signal) waiting for
+            // the next TurnComplete/Interrupted — correct by construction: SharedFlow.first{}
+            // only sees events emitted from this point on, so it can't observe a stale
+            // already-finished turn from before the phrase was even detected.
+            withTimeoutOrNull(drainTimeoutMs) {
+                liveSession.events.first { it is LiveSessionEvent.TurnComplete || it is LiveSessionEvent.Interrupted }
             }
-            onHangupRequested()
+            requestHangup("model closing phrase")
         }
     }
 
-    /** Drains briefly (lets already-in-flight reply audio reach the injector), then tears
-     *  everything down. Safe to call more than once (e.g. once from a hangup request and once
-     *  from the InCallService's call-ended callback racing it) — only the first call does
-     *  anything. */
+    /** Marks this session as ending and invokes [onHangupRequested] — at most once, and never
+     *  after [stop] has already torn things down (code review fix: the original version could
+     *  invoke [onHangupRequested] once per trigger — e.g. once for the closing phrase and again
+     *  for a terminal `Failed` racing it — which double-called `CallController.hangUp()` and,
+     *  since that job wasn't tracked, could outlive [stop] and disconnect a *subsequent* call). */
+    private fun requestHangup(reason: String) {
+        val job = scope.launch(exceptionHandler) {
+            val shouldHangUp = teardownMutex.withLock {
+                if (hungUpTriggered || stopped) {
+                    false
+                } else {
+                    hungUpTriggered = true
+                    true
+                }
+            }
+            if (shouldHangUp) {
+                Log.i(TAG, "phase=ENDING reason=$reason")
+                onStatus(currentStatusSnapshot(phase = BridgePhase.ENDING, endReason = reason))
+                onHangupRequested()
+            }
+        }
+        jobs += job
+    }
+
+    /**
+     * Tears everything down. Safe to call more than once, and safe to call while [start] is
+     * still opening (cancels [startJob] first rather than waiting out a 10s setup timeout) —
+     * only the first call does anything. Cancels every collector job and **joins** them before
+     * touching [injector]/[liveSession] (code review fix: cancelling a job and immediately
+     * closing a shared resource it might still be mid-write on is a use-after-close race).
+     */
     suspend fun stop(reason: String) {
         teardownMutex.withLock {
             if (stopped) return
             stopped = true
         }
         Log.i(TAG, "phase=ENDED reason=$reason — tearing down")
-        if (!hungUpTriggered) {
-            // A normal (non-hangup-triggered) teardown, e.g. the caller just hung up: still give
-            // any final buffered audio a moment before cutting the injector off.
-            delay(drainTimeoutMs)
-        }
-        jobs.forEach { it.cancel() }
+        startJob?.cancelAndJoin()
+        val toJoin = jobs.toList()
         jobs.clear()
+        toJoin.forEach { it.cancel() }
+        toJoin.joinAll()
         runCatching { injector.flush() }.onFailure { Log.w(TAG, "injector.flush() during teardown threw", it) }
         runCatching { injector.close() }.onFailure { Log.w(TAG, "injector.close() during teardown threw", it) }
         runCatching { liveSession.close() }.onFailure { Log.w(TAG, "liveSession.close() during teardown threw", it) }
@@ -279,7 +388,11 @@ class BridgeSession(
     private fun logRouteProbe() {
         val probe: RouteProbe = injector.probe()
         val routedType = (injector as? TelephonyTxInjector)?.getRoutedDevice()?.type
-        Log.i(TAG, "RouteProbe route=${probe.route} deviceFound=${probe.deviceFound} preferredDeviceSet=${probe.preferredDeviceSet} routedDeviceId=${probe.routedDeviceId} routedDeviceType=$routedType detail=${probe.detail}")
+        Log.i(
+            TAG,
+            "RouteProbe route=${probe.route} deviceFound=${probe.deviceFound} preferredDeviceSet=${probe.preferredDeviceSet} " +
+                "routedDeviceId=${probe.routedDeviceId} routedDeviceType=$routedType openSampleRateHz=${injector.openSampleRateHz} detail=${probe.detail}",
+        )
     }
 }
 
@@ -319,8 +432,7 @@ object BridgeSessionFactory {
             liveSession = liveSession,
             injector = injector,
             transcriptRecorder = transcriptRecorder,
-            audioChunks = pipeline.chunks,
-            vadEvents = pipeline.vadEvents,
+            pipelineEvents = pipeline.events,
             systemPrompt = systemPrompt,
             callerProfile = callerProfile,
             vadMode = vadMode,

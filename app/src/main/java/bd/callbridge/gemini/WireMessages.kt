@@ -77,5 +77,24 @@ data class RealtimeInputPayload(
 @Serializable
 data class AudioBlob(val data: String, val mimeType: String)
 
+/**
+ * A client-sent text turn (`clientContent`), used for [LiveSession.sendTextTurn] — the M3
+ * greeting kick, since the audio-output session has no other "speak first" mechanism (see
+ * `docs/gemini-live.md`). Valid alongside an AUDIO `responseModalities` setup: a text *input*
+ * turn producing an audio *output* turn is a normal Live API shape, distinct from
+ * `responseModalities` (which only constrains what the model replies with).
+ */
+@Serializable
+data class ClientContentEnvelope(val clientContent: ClientContentPayload)
+
+@Serializable
+data class ClientContentPayload(
+    val turns: List<ClientTurn>,
+    val turnComplete: Boolean = true,
+)
+
+@Serializable
+data class ClientTurn(val role: String, val parts: List<Part>)
+
 /** mimeType for 16 kHz PCM16 audio we send to the Live API (spec §4.4). */
 const val INPUT_AUDIO_MIME_TYPE = "audio/pcm;rate=16000"

@@ -172,6 +172,19 @@ class GeminiLiveSession(
         send(json.encodeToString(envelope))
     }
 
+    override fun sendTextTurn(text: String) {
+        // Deliberately does not call armResponseWatchdog(): see LiveSession.sendTextTurn's doc —
+        // a model that never answers the greeting's text turn must not fail the whole call 8s
+        // after pickup. The always-on dead-socket watchdog (60s) still applies.
+        send(
+            json.encodeToString(
+                ClientContentEnvelope(
+                    ClientContentPayload(turns = listOf(ClientTurn(role = "user", parts = listOf(Part(text = text))))),
+                ),
+            ),
+        )
+    }
+
     override fun sendActivityStart() {
         if (vadMode != VadMode.LOCAL_VAD) return
         send(json.encodeToString(RealtimeInputEnvelope(RealtimeInputPayload(activityStart = JsonObject(emptyMap())))))

@@ -3,7 +3,6 @@ package bd.callbridge.service
 import android.content.Context
 import android.telecom.Call
 import android.util.Log
-import bd.callbridge.Config
 import bd.callbridge.call.CallController
 import bd.callbridge.call.CallSessionCoordinator
 import bd.callbridge.gemini.CallerProfile
@@ -12,10 +11,13 @@ import bd.callbridge.store.CallBridgeDatabase
 import bd.callbridge.store.CallDirection
 import bd.callbridge.store.CallEntity
 import bd.callbridge.store.CallerRepository
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -37,6 +39,16 @@ private const val SHOP_NAME = "CallBridge দোকান"
  * Exposes [status] as the minimal StateFlow the status screen (spec §4.6) needs — brief calls for
  * "keep minimal; a StateFlow on the app singleton is fine", so this intentionally doesn't try to
  * be a general call-history API (that's `calls`/`turns` in Room, already there from M0).
+ *
+ * **Concurrency (code review fix):** [currentSession] is assigned *before* [BridgeSession.start]
+ * is called (construction is local/synchronous — no network) rather than after it returns, and
+ * [BridgeSession.start] itself now returns promptly (see its doc comment: the actual
+ * [bd.callbridge.gemini.LiveSession.open] network call runs in a background job the session owns
+ * and [BridgeSession.stop] can cancel directly). This closes the original gap where a call ending
+ * mid-open (`onCallEnded` racing a slow `open()`) had nothing to tear down yet, leaking the
+ * WebSocket/AudioTrack/AudioRecord/collectors for up to the full 10s setup timeout. [sessionMutex]
+ * is only ever held for the quick, synchronous field read/write — never across a suspending
+ * network call.
  */
 class BridgeSessionManager(
     private val context: Context,
@@ -56,39 +68,67 @@ class BridgeSessionManager(
     private var currentSession: BridgeSession? = null
     private var controller: CallController? = null
 
+    /** Tracks the in-flight [onCallActive] build/start job so [onCallEnded]/[onServiceDestroyed]
+     *  can cancel it if the call ends before [currentSession] even gets assigned (code review
+     *  fix, closing the last sliver of the "call ends during open" leak: [buildSession] does a
+     *  little local/DB work before [currentSession] is set, and without this a call ending in
+     *  that window would find nothing to stop and the build would complete/start anyway). */
+    private var pendingJob: Job? = null
+
     /** [CallController] can't easily be constructed before this manager (circular otherwise);
      *  wired once by [bd.callbridge.CallBridgeApp] right after both exist. */
     fun attach(callController: CallController) {
         controller = callController
     }
 
-    override fun onCallActive(call: Call, number: String) {
+    override fun onCallActive(call: Call, number: String, isOutgoing: Boolean) {
         BridgeForegroundService.start(context)
-        scope.launch {
-            sessionMutex.withLock {
+        pendingJob = scope.launch {
+            val session = try {
+                buildSession(number, isOutgoing)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to build BridgeSession for $number; hanging up", e)
+                controller?.hangUp()
+                return@launch
+            }
+
+            val accepted = sessionMutex.withLock {
                 if (currentSession != null) {
-                    Log.w(TAG, "onCallActive with a session already running; ignoring (one call at a time)")
-                    return@withLock
-                }
-                try {
-                    currentSession = buildAndStartSession(number)
-                } catch (e: Exception) {
-                    Log.e(TAG, "Failed to start BridgeSession for $number; hanging up", e)
-                    controller?.hangUp()
+                    false
+                } else {
+                    currentSession = session
+                    true
                 }
             }
+            if (!accepted) {
+                Log.w(TAG, "onCallActive with a session already running; ignoring (one call at a time)")
+                runCatching { session.stop("superseded: session already running") }
+                return@launch
+            }
+
+            // start() returns promptly (the network open runs in a background job the session
+            // itself owns) — the mutex is never held across it.
+            session.start()
         }
     }
 
     override fun onCallEnded() {
-        scope.launch { stopCurrentSession("call ended") }
+        scope.launch { endActiveOrPendingSession("call ended") }
     }
 
     override fun onServiceDestroyed() {
-        scope.launch { stopCurrentSession("service destroyed") }
+        scope.launch { endActiveOrPendingSession("service destroyed") }
     }
 
-    private suspend fun buildAndStartSession(number: String): BridgeSession {
+    private suspend fun endActiveOrPendingSession(reason: String) {
+        pendingJob?.cancelAndJoin()
+        pendingJob = null
+        stopCurrentSession(reason)
+    }
+
+    private suspend fun buildSession(number: String, isOutgoing: Boolean): BridgeSession {
         val caller = callerRepository.find(number)
         val profile = CallerProfile(
             number = number,
@@ -100,13 +140,16 @@ class BridgeSessionManager(
         val callId = database.callDao().insert(
             CallEntity(
                 number = number,
-                direction = CallDirection.INBOUND,
+                // isOutgoing is true for our own outbound callback leg connecting (spec §3's
+                // registered-caller callback flow) — code review fix, this was previously
+                // hardcoded to INBOUND for every call.
+                direction = if (isOutgoing) CallDirection.OUTBOUND_CALLBACK else CallDirection.INBOUND,
                 startedAt = startedAtMs,
             )
         )
         val systemPrompt = SystemPromptBuilder.build(context, profile, SHOP_NAME)
 
-        val session = BridgeSessionFactory.create(
+        return BridgeSessionFactory.create(
             context = context,
             callerProfile = profile,
             systemPrompt = systemPrompt,
@@ -118,8 +161,6 @@ class BridgeSessionManager(
             onHangupRequested = { controller?.hangUp() },
             onStatus = { _status.value = it },
         )
-        session.start()
-        return session
     }
 
     private suspend fun stopCurrentSession(reason: String) {

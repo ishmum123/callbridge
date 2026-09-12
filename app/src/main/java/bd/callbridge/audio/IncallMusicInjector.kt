@@ -45,6 +45,9 @@ import android.util.Log
 class IncallMusicInjector : Injector {
     override val route: InjectorRoute = InjectorRoute.INCALL_MUSIC
 
+    /** Always null: this route never actually plays anything (see class doc). */
+    override val openSampleRateHz: Int? = null
+
     private var probeDetail: String = "not probed yet"
     private var probed = false
 

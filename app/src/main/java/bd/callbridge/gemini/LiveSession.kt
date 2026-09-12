@@ -99,6 +99,17 @@ interface LiveSession {
      */
     fun sendAudio(pcm: ShortArray)
 
+    /**
+     * Sends a client text turn (`clientContent`, `turnComplete=true`) — the M3 greeting-kick
+     * mechanism: the session is audio-output-only and has no other way to make the model speak
+     * first, so a short text instruction (e.g. "call just connected, greet in Bangla") stands in
+     * for a synthetic first user turn. Deliberately does **not** arm the response watchdog (see
+     * [GeminiLiveSession]'s class doc): a model that never answers this one text turn must not
+     * fail the whole call 8s after pickup — the always-on dead-socket watchdog still catches a
+     * genuinely dead connection.
+     */
+    fun sendTextTurn(text: String)
+
     /** Count of audio chunks dropped so far because the outbound socket queue was too full. */
     val droppedAudioChunkCount: Long
 
@@ -138,6 +149,9 @@ class UnimplementedLiveSession : LiveSession {
         throw NotImplementedError("Use GeminiLiveSession for a real Live API connection.")
 
     override fun sendAudio(pcm: ShortArray): Nothing =
+        throw NotImplementedError("Use GeminiLiveSession for a real Live API connection.")
+
+    override fun sendTextTurn(text: String): Nothing =
         throw NotImplementedError("Use GeminiLiveSession for a real Live API connection.")
 
     override val droppedAudioChunkCount: Long = 0L

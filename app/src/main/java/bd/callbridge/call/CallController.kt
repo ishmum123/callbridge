@@ -29,8 +29,10 @@ private const val BUSY_SMS_TEXT = "Sorry, we're on another call right now. We'll
  */
 interface CallSessionCoordinator {
     /** The call reached [CallState.ACTIVE]. [call] is the live Telecom call object (for anything
-     *  the session needs from it beyond the number); [number] is the caller's number. */
-    fun onCallActive(call: Call, number: String)
+     *  the session needs from it beyond the number); [number] is the caller's number; [isOutgoing]
+     *  is true for our own outbound callback leg connecting (spec §3's registered-caller callback
+     *  flow), false for a normal inbound call answered directly. */
+    fun onCallActive(call: Call, number: String, isOutgoing: Boolean)
 
     /** The active call ended (Telecom `onCallRemoved`/`STATE_DISCONNECTED`). Safe to call even
      *  when no session is running. */
@@ -114,7 +116,7 @@ class CallController(
         val call = activeTelecomCall
         val number = stateMachine.currentNumber
         if (call != null && number != null && stateMachine.state == CallState.ACTIVE) {
-            runCatching { sessionCoordinator?.onCallActive(call, number) }
+            runCatching { sessionCoordinator?.onCallActive(call, number, isOutgoing(call)) }
                 .onFailure { Log.e(TAG, "sessionCoordinator.onCallActive threw", it) }
         }
     }

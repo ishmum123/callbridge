@@ -18,6 +18,9 @@ import android.util.Log
 class LoopbackInjector(@Suppress("UNUSED_PARAMETER") context: Context) : Injector {
     override val route: InjectorRoute = InjectorRoute.LOOPBACK
 
+    override val openSampleRateHz: Int?
+        get() = if (track != null) SAMPLE_RATE_HZ else null
+
     private var track: AudioTrack? = null
     private var lastDetail = "not opened yet"
 

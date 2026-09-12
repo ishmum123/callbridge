@@ -9,7 +9,9 @@ import android.os.Bundle
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.lifecycleScope
+import androidx.lifecycle.repeatOnLifecycle
 import bd.callbridge.CallBridgeApp
 import bd.callbridge.audio.NativeBridge
 import bd.callbridge.Config
@@ -80,12 +82,23 @@ class StatusActivity : AppCompatActivity() {
      *  "a StateFlow on the app singleton is fine") — calls-today/cost-today stay TODO. */
     private fun observeBridgeStatus() {
         val app = application as CallBridgeApp
+        // repeatOnLifecycle(STARTED) rather than a bare lifecycleScope.launch: stops collecting
+        // (and re-subscribes) around STARTED/STOPPED instead of leaking a collector that keeps
+        // running while the screen is backgrounded (minor review finding).
         lifecycleScope.launch {
-            app.bridgeSessionManager.status.collect { status ->
-                binding.textCaller.text = "Caller: ${status.callerNumber ?: "-"}"
-                binding.textSocket.text = "Socket: ${if (status.socketOpen) "open" else "not connected"} (${status.phase})"
-                binding.textRoute.text = "Injector route: ${status.injectorRoute ?: Config.injectorRoute} (native: ${runCatching { NativeBridge.nativeVersion() }.getOrDefault("n/a")})"
-                status.lastTranscriptLine?.let { binding.textState.text = "State: ${app.callController.state} — $it" }
+            repeatOnLifecycle(Lifecycle.State.STARTED) {
+                app.bridgeSessionManager.status.collect { status ->
+                    binding.textCaller.text = "Caller: ${status.callerNumber ?: "-"}"
+                    binding.textSocket.text = "Socket: ${if (status.socketOpen) "open" else "not connected"} (${status.phase})"
+                    binding.textRoute.text = "Injector route: ${status.injectorRoute ?: Config.injectorRoute} (native: ${runCatching { NativeBridge.nativeVersion() }.getOrDefault("n/a")})"
+                    // Always reflect the current phase, even when this particular status update
+                    // carries no new transcript line (minor review finding: previously the state
+                    // text only updated when lastTranscriptLine was non-null).
+                    binding.textState.text = buildString {
+                        append("State: ${app.callController.state} (${status.phase})")
+                        status.lastTranscriptLine?.let { append(" — $it") }
+                    }
+                }
             }
         }
     }

@@ -21,6 +21,17 @@ package bd.callbridge.audio
 interface Injector {
     val route: InjectorRoute
 
+    /**
+     * The sample rate actually negotiated for output audio once [open] has run — e.g.
+     * [TelephonyTxInjector] tries 16 kHz/stereo first and falls back to 8 kHz/mono, so this can
+     * only be known post-open, not assumed from a fixed constant (M3 code review finding: a
+     * caller resampling Gemini's 24 kHz output must resample to *this* rate, not a hardcoded
+     * 16 kHz, or it gets half-speed/garbled audio on the 8 kHz fallback). Null before [open] (or
+     * for a route where the concept doesn't apply, e.g. [IncallMusicInjector], which never
+     * actually plays anything).
+     */
+    val openSampleRateHz: Int?
+
     /** Opens the output track/device. Idempotent. */
     fun open()
 
@@ -72,6 +83,8 @@ data class RouteProbe(
 /** Default injector until a real route is wired up (M1b). Logs and drops audio. */
 class NoopInjector : Injector {
     override val route: InjectorRoute = InjectorRoute.NOOP
+
+    override val openSampleRateHz: Int? = null
 
     override fun open() = Unit
 

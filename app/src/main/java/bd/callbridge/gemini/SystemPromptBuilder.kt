@@ -22,6 +22,14 @@ object SystemPromptBuilder {
      */
     const val HANGUP_PHRASE = "আল্লাহ হাফেজ, ভালো থাকবেন।"
 
+    /**
+     * Text sent via [LiveSession.sendTextTurn] right after `setupComplete` to make the model
+     * speak first (M3 greeting kick — code review fix, replacing an empty
+     * `activityStart`/`activityEnd` pair that armed the response watchdog). Relies on the
+     * template's own "শুরুতে সংক্ষেপে নিজের পরিচয় দাও..." instruction for what to actually say.
+     */
+    const val GREETING_TRIGGER = "কল শুরু হয়েছে, নিজের পরিচয় দাও।"
+
     // Fixed to Locale.US (English month names) rather than the device default so tests and
     // production stay deterministic regardless of the phone's locale.
     private val DATE_FORMAT: DateTimeFormatter = DateTimeFormatter.ofPattern("d MMMM yyyy", Locale.US)
