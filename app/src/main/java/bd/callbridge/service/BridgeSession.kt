@@ -564,7 +564,7 @@ object BridgeSessionFactory {
         )
         val injector = InjectorFactory.create(Config.injectorRoute, context)
         val capture = VoiceCallCapture(context)
-        val pipeline = AudioPipeline(capture)
+        val pipeline = AudioPipeline(capture, gateAudio = vadMode == VadMode.LOCAL_VAD)
         val transcriptRecorder = TranscriptRecorder(
             callId = callId,
             turnDao = turnDao,

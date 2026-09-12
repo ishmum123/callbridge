@@ -35,6 +35,11 @@ class AudioPipeline(
     private val vadGateFactory: () -> VadGate = { VadGate() },
     sampleRateHz: Int = Config.CAPTURE_SAMPLE_RATE_HZ,
     chunkMs: Int = 100,
+    /** When false, every frame is emitted as a [PipelineEvent.Chunk] regardless of the local
+     *  gate (server-side VAD needs the continuous stream). VAD events are still emitted for
+     *  logging/round-trip timing. Observed on device: the GSM downlink sits well under the local
+     *  gate's min threshold, so gated mode starved Gemini VAD of caller audio. */
+    private val gateAudio: Boolean = true,
 ) {
     private val chunkSamples = sampleRateHz * chunkMs / 1000
 
@@ -98,7 +103,8 @@ class AudioPipeline(
                     _vadEvents.tryEmit(event)
                     emit(PipelineEvent.Vad(event))
                 }
-                for (outFrame in result.frames) {
+                val outFrames = if (gateAudio) result.frames else listOf(frameBuf.copyOf())
+                for (outFrame in outFrames) {
                     var fOffset = 0
                     while (fOffset < outFrame.size) {
                         val m = minOf(chunkSamples - chunkBufLen, outFrame.size - fOffset)
