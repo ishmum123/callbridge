@@ -145,6 +145,8 @@ class BridgeSession(
     @Volatile private var isModelSpeaking = false
     @Volatile private var suppressStaleAudio = false
     @Volatile private var lastSpeechEndedAtMs: Long? = null
+    @Volatile private var lastModelAudioMs: Long = 0L
+    @Volatile private var activeAtMs: Long = 0L
     @Volatile private var firstAudioLogged = false
 
     private val jobs = CopyOnWriteArrayList<Job>()
@@ -220,6 +222,7 @@ class BridgeSession(
                 return@launch
             }
             sessionActive = true
+            activeAtMs = nowMs()
             Log.i(TAG, "phase=ACTIVE caller=${callerProfile.number} socket=open")
             onStatus(currentStatusSnapshot(phase = BridgePhase.ACTIVE))
 
@@ -241,7 +244,15 @@ class BridgeSession(
                 // HALF_DUPLEX demo mode: while the model is speaking, don't feed caller-side audio
                 // to Gemini at all — the GSM downlink carries echo of our own injected reply and
                 // venue noise, which the server VAD read as barge-in (greeting cut at 640 ms).
-                if (Config.HALF_DUPLEX && isModelSpeaking) return
+                if (Config.HALF_DUPLEX && isModelSpeaking) {
+                    // Observed on device (15:10 calls): TurnComplete never arrived after the
+                    // greeting under GEMINI_VAD, so a TurnComplete-only reset muted the caller for
+                    // the whole call. Treat >MODEL_IDLE_MS without model audio as "done speaking".
+                    val idleFor = nowMs() - lastModelAudioMs
+                    if (idleFor < MODEL_IDLE_MS) return
+                    Log.i(TAG, "model audio idle ${idleFor}ms -> resuming caller audio (half-duplex)")
+                    isModelSpeaking = false
+                }
                 liveSession.sendAudio(event.pcm)
                 transcriptRecorder.onAudioSent(event.pcm)
             }
@@ -260,6 +271,7 @@ class BridgeSession(
                     // kept writing every subsequent frame of the interrupted turn).
                     return
                 }
+                lastModelAudioMs = nowMs()
                 if (!isModelSpeaking) {
                     isModelSpeaking = true
                     val speechEndedAt = lastSpeechEndedAtMs
@@ -423,6 +435,13 @@ class BridgeSession(
      *  (code review fix: that could cut the goodbye off mid-sentence, since the delta arrives
      *  well before the matching audio is done generating). */
     private fun onHangupPhraseDetected() {
+        val sinceActive = nowMs() - activeAtMs
+        if (sinceActive < HANGUP_IGNORE_WINDOW_MS) {
+            // Observed on device (15:10 call): the model appended the closing phrase to its own
+            // greeting, which hung up a 10 s call. Never treat the phrase as a hangup this early.
+            Log.w(TAG, "hangup phrase in transcript ${sinceActive}ms after ACTIVE — ignored (greeting window)")
+            return
+        }
         scope.launch(exceptionHandler) {
             Log.i(TAG, "hangup phrase detected in transcript; draining until TurnComplete or ${drainTimeoutMs}ms")
             // A fresh subscription to liveSession.events (not a side-channel signal) waiting for
@@ -566,3 +585,6 @@ object BridgeSessionFactory {
         )
     }
 }
+
+private const val MODEL_IDLE_MS = 800L
+private const val HANGUP_IGNORE_WINDOW_MS = 15_000L
