@@ -14,6 +14,7 @@ Last updated: 2026-09-12 (M0 scaffold commit).
 | M2 — Bridge | Code-complete, unit-tested + live-smoke-tested against the real Gemini Live API. `GeminiLiveSession` (real OkHttp WebSocket client), `TranscriptRecorder`, `CostModel`, `SystemPromptBuilder` land in `gemini/`. Not yet wired to `audio/`/`Injector`/`service/` (that's M3). See [`docs/gemini-live.md`](./gemini-live.md). |
 | M3 — Polish | Pending. |
 | M4 — Shop pilot | Pending. |
+| Patient profile (demo, not in spec) | Code-complete, unit-tested + live-smoke-tested against the real Gemini REST `generateContent` endpoint. See section below. |
 
 ## What M0 actually built
 
@@ -56,6 +57,60 @@ All three packages contain doc comments pointing at the exact file/interface to 
 - Watchdog (spec §4.4, 8s) is implemented **inside** `GeminiLiveSession` itself (deviation from this note's original suggestion of the orchestration layer) — see `docs/gemini-live.md` for why.
 - `TranscriptRecorder` (file: `gemini/TranscriptRecorder.kt`) writes `turns` rows per completed turn and accumulates cost onto the `calls` row via `CostModel`; it also detects the `[HANGUP]` token and exposes `hangupRequested: SharedFlow<Unit>` — this is prompt-domain logic kept out of `GeminiLiveSession` on purpose.
 - **Not done (next milestone's job)**: wiring `LiveSession`/`TranscriptRecorder`/`SystemPromptBuilder` into `service/`, resampling `AudioOut` (24 kHz) down to 8 kHz before `Injector.write()`, resampling captured audio up to 16 kHz before `sendAudio`, and actually driving `sendActivityStart`/`sendActivityEnd` from the audio pipeline's VAD gate. `sendAudio` still just expects pre-resampled 16 kHz PCM16 mono ~100 ms chunks handed to it.
+
+## Patient profile (demo feature, not in the original spec)
+
+A per-caller clinical profile for health managers, built up call-over-call. Not wired into the
+live call flow — that one line is left for whoever owns `CallController`/`BridgeSession` (M3).
+
+- **Store**: `PatientProfileEntity` (keyed by phone number) + `ProfileUpdateEntity` (per-call
+  delta history) in `store/Entities.kt`; `PatientProfileDao`/`ProfileUpdateDao` in
+  `store/dao/Daos.kt`; `ProfileRepository`/`RoomProfileRepository` in `store/ProfileRepository.kt`.
+  DB bumped to `version = 2` with `fallbackToDestructiveMigration()` (demo-acceptable; no
+  migration path from v1). List-of-string fields are stored as JSON via new `Converters`
+  (`fromStringList`/`toStringList`).
+- **Summarizer**: `profile/ProfileSummarizer.kt`. `suspend fun onCallFinished(callId: Long)` loads
+  the call's `turns` + any existing profile, calls Gemini's REST `generateContent` endpoint
+  (`Config.GEMINI_SUMMARY_MODEL_ID = "gemini-2.5-flash"` — **not** the Live API/WebSocket) with
+  `responseMimeType: application/json` + a `responseSchema` matching the entity, and asks the
+  model to return the *complete merged* profile (existing facts kept unless contradicted) plus a
+  `deltaSummary` for the per-call history row. Runs on `Dispatchers.IO`, never throws to the
+  caller; an empty transcript is skipped entirely; any HTTP/parse failure is logged and recorded
+  as `PatientProfileEntity.lastError`, leaving the rest of the profile untouched.
+  Verified against the real API: `ProfileSummarizerSmokeTest` (gated exactly like
+  `GeminiLiveSmokeTest` — `-PliveSmoke=true` + `GEMINI_API_KEY` in `local.properties`) got back a
+  correctly-parsed profile with Bangla + English summaries from a real Bangla fever/cough
+  transcript.
+- **Wiring left for the orchestrator** (not done by this worker — another worker owns
+  `CallController`/`BridgeSession`): call this one line right after a call's
+  `TranscriptRecorder.finish(endReason)` completes:
+  ```kotlin
+  (applicationContext as CallBridgeApp).profileSummarizer.onCallFinished(callId)
+  ```
+  Fire-and-forget from a non-blocking scope is fine.
+- **Debug path** (exercise without a live call): `DebugInjectReceiver` gained two actions
+  (`app/src/debug/java/bd/callbridge/debug/DebugInjectReceiver.kt`,
+  `app/src/debug/AndroidManifest.xml`):
+  ```
+  adb shell am broadcast -a bd.callbridge.DEBUG_SEED_CALL --es number 01700000099
+  adb shell am broadcast -a bd.callbridge.DEBUG_SUMMARIZE
+  adb shell am broadcast -a bd.callbridge.DEBUG_SUMMARIZE --el callId 1
+  adb logcat -s InjectTest
+  ```
+  `DEBUG_SEED_CALL` inserts a finished fake call with a realistic 6-turn Bangla transcript (fever
+  + cough, then the same caller asking about iron tablets as a pregnant woman). `DEBUG_SUMMARIZE`
+  runs the summarizer for a given `callId` or the most recent call if omitted.
+- **UI**: `ui/PatientsListActivity.kt` (list of profiles — name/number, last call, risk-flag
+  chips, follow-up badge; reachable from `StatusActivity`'s new "Patients" button) and
+  `ui/PatientDetailActivity.kt` (all fields grouped: Summary / Conditions & symptoms /
+  Medications & allergies / Risk flags / Advice & follow-up / Call history with per-call delta).
+  Plain Views + view binding + Material components (`MaterialCardView`, `Chip`), matching the
+  rest of the app's UI toolkit — no new dependency added.
+- **Tests**: `profile/ProfileSummarizerTest.kt` (MockWebServer — empty-transcript skip, successful
+  merge + delta row, HTTP failure records `lastError` without touching existing fields, unparsable
+  JSON handled the same way), `store/PatientProfileDaoTest.kt` (Robolectric, same pattern as
+  `CaptureWavDumperTest` — upsert/find round-trip including list columns, REPLACE-on-conflict,
+  update-history ordering), `profile/ProfileSummarizerSmokeTest.kt` (real-API gated smoke test).
 
 ## Known deviations / open items from the spec
 

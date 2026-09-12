@@ -67,6 +67,16 @@
             android:exported="false"
             android:label="@string/register_caller_title" />
 
+        <activity
+            android:name=".ui.PatientsListActivity"
+            android:exported="false"
+            android:label="@string/patients_title" />
+
+        <activity
+            android:name=".ui.PatientDetailActivity"
+            android:exported="false"
+            android:label="@string/patient_detail_title" />
+
         <service
             android:name=".call.CallBridgeInCallService"
             android:exported="true"

@@ -20,6 +20,11 @@ object Config {
     const val GEMINI_MODEL_ID: String = "gemini-3.1-flash-live-preview"
     const val GEMINI_MODEL_FALLBACK: String = "gemini-2.5-flash-native-audio-preview-12-2025"
 
+    /** Text/JSON model for the Patient profile summarizer's REST `generateContent` calls (NOT the
+     *  Live API — this is a plain request/response call, no WebSocket). Verified 2026-09-12 via
+     *  `ProfileSummarizerSmokeTest` against the real key. */
+    const val GEMINI_SUMMARY_MODEL_ID: String = "gemini-2.5-flash"
+
     /** Read from local.properties -> BuildConfig at build time. Never commit a real key. */
     val geminiApiKey: String get() = BuildConfig.GEMINI_API_KEY
 

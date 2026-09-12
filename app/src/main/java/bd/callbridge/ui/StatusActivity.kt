@@ -60,6 +60,9 @@ class StatusActivity : AppCompatActivity() {
         binding.btnRegisterCaller.setOnClickListener {
             startActivity(Intent(this, RegisterCallerActivity::class.java))
         }
+        binding.btnPatients.setOnClickListener {
+            startActivity(Intent(this, PatientsListActivity::class.java))
+        }
     }
 
     private fun renderStaticStatus() {

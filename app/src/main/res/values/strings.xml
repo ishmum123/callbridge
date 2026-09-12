@@ -15,4 +15,16 @@
     <string name="hint_village">Village</string>
     <string name="hint_occupation">Occupation</string>
     <string name="btn_save">Save</string>
+
+    <string name="btn_patients">Patients</string>
+    <string name="patients_title">Patients</string>
+    <string name="patients_empty">No patient profiles yet. Seed a demo call from adb, or wait for a real one to finish.</string>
+    <string name="patient_detail_title">Patient</string>
+    <string name="label_follow_up_needed">Follow-up needed</string>
+    <string name="section_summary">Summary</string>
+    <string name="section_conditions">Conditions &amp; symptoms</string>
+    <string name="section_medications">Medications &amp; allergies</string>
+    <string name="section_risk_flags">Risk flags</string>
+    <string name="section_advice">Advice &amp; follow-up</string>
+    <string name="section_call_history">Call history</string>
 </resources>

@@ -2,8 +2,10 @@ package bd.callbridge
 
 import android.app.Application
 import bd.callbridge.call.CallController
+import bd.callbridge.profile.ProfileSummarizer
 import bd.callbridge.store.CallBridgeDatabase
 import bd.callbridge.store.RoomCallerRepository
+import bd.callbridge.store.RoomProfileRepository
 
 class CallBridgeApp : Application() {
 
@@ -11,7 +13,24 @@ class CallBridgeApp : Application() {
 
     val callerRepository by lazy { RoomCallerRepository(database) }
 
+    val profileRepository by lazy { RoomProfileRepository(database) }
+
     val callController: CallController by lazy {
         CallController(context = this, callerRepository = callerRepository)
+    }
+
+    /**
+     * Patient profile summarizer (demo feature). See [ProfileSummarizer]'s doc comment for the
+     * exact wiring call the M3 orchestration worker should add once a call's transcript is
+     * finished.
+     */
+    val profileSummarizer: ProfileSummarizer by lazy {
+        ProfileSummarizer(
+            turnDao = database.turnDao(),
+            callDao = database.callDao(),
+            profileDao = database.patientProfileDao(),
+            profileUpdateDao = database.profileUpdateDao(),
+            apiKey = { Config.geminiApiKey },
+        )
     }
 }

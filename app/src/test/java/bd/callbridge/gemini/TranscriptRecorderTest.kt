@@ -33,6 +33,7 @@ private class FakeCallDao(initial: CallEntity) : CallDao {
     override suspend fun findById(id: Long): CallEntity? = stored.takeIf { it.id == id }
     override fun observeCallsSince(sinceEpochMs: Long): Flow<Int> = flowOf(0)
     override fun observeCostSince(sinceEpochMs: Long): Flow<Double> = flowOf(0.0)
+    override suspend fun findLatest(): CallEntity? = stored
 }
 
 @OptIn(ExperimentalCoroutinesApi::class)

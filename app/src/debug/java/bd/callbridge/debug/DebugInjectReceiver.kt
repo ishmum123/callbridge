@@ -6,6 +6,7 @@ import android.content.Intent
 import android.media.AudioDeviceInfo
 import android.util.Log
 import bd.callbridge.BuildConfig
+import bd.callbridge.CallBridgeApp
 import bd.callbridge.audio.CaptureWavDumper
 import bd.callbridge.audio.Injector
 import bd.callbridge.audio.InjectorFactory
@@ -13,6 +14,10 @@ import bd.callbridge.audio.InjectorRoute
 import bd.callbridge.audio.TelephonyTxInjector
 import bd.callbridge.audio.TestTone
 import bd.callbridge.audio.VoiceCallCapture
+import bd.callbridge.store.CallDirection
+import bd.callbridge.store.CallEntity
+import bd.callbridge.store.TurnEntity
+import bd.callbridge.store.TurnRole
 import java.io.File
 import kotlin.math.abs
 import kotlin.math.sqrt
@@ -58,6 +63,14 @@ class DebugInjectReceiver : BroadcastReceiver() {
             ACTION_CAPTURE -> {
                 val seconds = intent.getIntExtra(EXTRA_SECONDS, DEFAULT_SECONDS)
                 runCaptureTest(appContext, seconds, pendingResult)
+            }
+            ACTION_SUMMARIZE -> {
+                val callId = if (intent.hasExtra(EXTRA_CALL_ID)) intent.getLongExtra(EXTRA_CALL_ID, -1L) else null
+                runSummarizeTest(appContext, callId, pendingResult)
+            }
+            ACTION_SEED_CALL -> {
+                val number = intent.getStringExtra(EXTRA_NUMBER) ?: DEFAULT_SEED_NUMBER
+                runSeedCallTest(appContext, number, pendingResult)
             }
             else -> {
                 Log.w(TAG, "unrecognized action: ${intent.action}")
@@ -232,6 +245,76 @@ class DebugInjectReceiver : BroadcastReceiver() {
         }
     }
 
+    /**
+     * `bd.callbridge.DEBUG_SUMMARIZE [--el callId N]`: runs [ProfileSummarizer.onCallFinished]
+     * for the given call, or the most recently inserted call if `callId` is omitted. Lets the
+     * Patient profile feature be exercised from adb without wiring it into a real live call
+     * (that wiring is left to whoever owns `CallController`/`BridgeSession`).
+     */
+    private fun runSummarizeTest(appContext: Context, callId: Long?, pendingResult: PendingResult) {
+        CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
+            try {
+                val app = appContext as CallBridgeApp
+                val resolvedId = callId ?: app.database.callDao().findLatest()?.id
+                if (resolvedId == null) {
+                    Log.w(TAG, "InjectTest: SUMMARIZE no calls in DB, nothing to summarize")
+                    return@launch
+                }
+                Log.i(TAG, "InjectTest: SUMMARIZE starting callId=$resolvedId")
+                app.profileSummarizer.onCallFinished(resolvedId)
+                val call = app.database.callDao().findById(resolvedId)
+                val profile = call?.let { app.database.patientProfileDao().find(it.number) }
+                Log.i(
+                    TAG,
+                    "InjectTest: SUMMARIZE RESULT callId=$resolvedId number=${call?.number} " +
+                        "ok=${profile?.lastError == null} lastError=${profile?.lastError} " +
+                        "summaryEn=${profile?.summaryEn} riskFlags=${profile?.riskFlags}",
+                )
+            } catch (e: Exception) {
+                Log.e(TAG, "InjectTest: SUMMARIZE threw", e)
+            } finally {
+                pendingResult.finish()
+            }
+        }
+    }
+
+    /**
+     * `bd.callbridge.DEBUG_SEED_CALL [--es number 01700000099]`: inserts a finished fake call with
+     * a realistic 6-turn Bangla health conversation (fever/cough + a pregnant caller asking about
+     * iron tablets) so the Patients screen and DEBUG_SUMMARIZE can be demoed without a live call.
+     */
+    private fun runSeedCallTest(appContext: Context, number: String, pendingResult: PendingResult) {
+        CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
+            try {
+                val app = appContext as CallBridgeApp
+                val startedAt = System.currentTimeMillis()
+                val callId = app.database.callDao().insert(
+                    CallEntity(number = number, direction = CallDirection.INBOUND, startedAt = startedAt)
+                )
+                val turns = listOf(
+                    TurnRole.CALLER to "আমার তিন দিন ধরে জ্বর আর কাশি হচ্ছে।",
+                    TurnRole.ASSISTANT to "বুঝলাম। জ্বর কতটা বেশি, আর কাশির সাথে কি বুকে ব্যথা বা শ্বাসকষ্ট হচ্ছে?",
+                    TurnRole.CALLER to "জ্বর মোটামুটি ১০১ ডিগ্রি, বুকে ব্যথা নেই কিন্তু কাশিটা শুকনো।",
+                    TurnRole.ASSISTANT to "ঠিক আছে, প্যারাসিটামল খেতে পারেন এবং পর্যাপ্ত পানি পান করুন। জ্বর ৩ দিনের বেশি থাকলে বা শ্বাসকষ্ট হলে দ্রুত ডাক্তার দেখাবেন।",
+                    TurnRole.CALLER to "আরেকটা কথা, আমি পাঁচ মাসের অন্তঃসত্ত্বা, আয়রন ট্যাবলেট খাওয়া কি ঠিক হবে?",
+                    TurnRole.ASSISTANT to "হ্যাঁ, গর্ভাবস্থায় সাধারণত আয়রন ট্যাবলেট প্রয়োজন হয়। তবে নিয়মিত চেকআপের ডাক্তারের সাথে ডোজ নিশ্চিত করে নেবেন।",
+                )
+                turns.forEachIndexed { i, (role, text) ->
+                    app.database.turnDao().insert(TurnEntity(callId = callId, role = role, text = text, tMs = i * 4_000L))
+                }
+                val endedAt = startedAt + turns.size * 4_000L
+                app.database.callDao().findById(callId)?.let {
+                    app.database.callDao().update(it.copy(endedAt = endedAt, endReason = "debug_seed"))
+                }
+                Log.i(TAG, "InjectTest: SEED_CALL RESULT callId=$callId number=$number turns=${turns.size}")
+            } catch (e: Exception) {
+                Log.e(TAG, "InjectTest: SEED_CALL threw", e)
+            } finally {
+                pendingResult.finish()
+            }
+        }
+    }
+
     private fun deviceTypeName(type: Int): String = when (type) {
         AudioDeviceInfo.TYPE_TELEPHONY -> "TYPE_TELEPHONY"
         AudioDeviceInfo.TYPE_BUILTIN_SPEAKER -> "TYPE_BUILTIN_SPEAKER"
@@ -248,10 +331,15 @@ class DebugInjectReceiver : BroadcastReceiver() {
         const val TAG = "InjectTest"
         const val ACTION_INJECT = "bd.callbridge.DEBUG_INJECT"
         const val ACTION_CAPTURE = "bd.callbridge.DEBUG_CAPTURE"
+        const val ACTION_SUMMARIZE = "bd.callbridge.DEBUG_SUMMARIZE"
+        const val ACTION_SEED_CALL = "bd.callbridge.DEBUG_SEED_CALL"
 
         private const val EXTRA_ROUTE = "route"
         private const val EXTRA_SECONDS = "seconds"
         private const val EXTRA_FREQ = "freq"
+        private const val EXTRA_CALL_ID = "callId"
+        private const val EXTRA_NUMBER = "number"
+        private const val DEFAULT_SEED_NUMBER = "01700000099"
 
         private const val DEFAULT_ROUTE = "TELEPHONY_TX"
         private const val DEFAULT_SECONDS = 5

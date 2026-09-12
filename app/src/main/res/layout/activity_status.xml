@@ -74,4 +74,11 @@
         android:layout_marginTop="8dp"
         android:text="@string/btn_register_caller" />
 
+    <Button
+        android:id="@+id/btnPatients"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="8dp"
+        android:text="@string/btn_patients" />
+
 </LinearLayout>
