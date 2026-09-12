@@ -62,3 +62,35 @@ All three packages contain doc comments pointing at the exact file/interface to 
 - `CAPTURE_AUDIO_OUTPUT` / `MODIFY_PHONE_STATE` / etc. are declared in the manifest but are only functional once installed as a priv-app via the Magisk module — expected per spec §5, not a bug.
 - Gemini model id and Live API pricing figures in `callbridge-spec.md` §2/§9, marked "verify" in the spec, are now verified (2026-09-12) against live docs and a real API call — see `docs/gemini-live.md`. Both match the spec's placeholder values exactly.
 - No on-device testing was possible during the M0 build (no phone attached). All acceptance was via `./gradlew assembleDebug`/`test`/`lint` and `bash -n` on the install script.
+
+## Health knowledge tool (worker, 2026-09-12)
+
+New `knowledge/` package (`HealthKnowledge`, `KnowledgeAnswer`, `ExaKnowledge`, `OpenAiKnowledge`,
+`CompositeHealthKnowledge`) + `gemini/HealthPromptBn.kt` for the health-only demo persona. Not
+wired into `GeminiLiveSession`/`BridgeSession` yet — see `docs/gemini-tools.md`'s "Wiring steps"
+section for the next worker's exact TODOs (add `tools` to setup, add `ToolCall`/
+`ToolCallCancelled` events, add `sendToolResponse`, hook `CompositeHealthKnowledge` into the
+orchestration layer).
+
+- `ExaKnowledge`: `POST https://api.exa.ai/search`, `x-api-key` header, `includeDomains` restricted
+  to who.int/nhs.uk/mayoclinic.org/medlineplus.gov/icddrb.org/dghs.gov.bd, top 3 highlights.
+  Verified live: real paracetamol-dosing query returned NHS/Barnsley-NHS/CEM-Scotland-NHS results
+  in ~1.9s.
+- `OpenAiKnowledge`: `gpt-4o-mini` (verified present via `GET /v1/models` on this project's key;
+  `gpt-5-mini`/`gpt-5-nano` also present but `gpt-5-mini` burned ~1600 hidden reasoning tokens on
+  an identical prompt in a live timing check — `gpt-4o-mini` returns a full answer in ~2.2s with
+  no reasoning overhead, safer against the 6s per-provider timeout). System prompt: concise
+  evidence-based guidance, ≤120 words, explicit red-flag flagging, never a definitive diagnosis.
+- `CompositeHealthKnowledge`: Exa first, OpenAI fallback on error/empty/exception, never throws
+  (returns a "no information available" `KnowledgeAnswer` if both fail or are disabled).
+  `fromKeys(exaKey, openAiKey)` factory disables a provider whose key is blank.
+- `BuildConfig.EXA_API_KEY` / `BuildConfig.OPENAI_API_KEY` added in `app/build.gradle.kts`,
+  sourced from `local.properties` the same way `GEMINI_API_KEY` already is.
+- Gemini Live tool-calling wire protocol verified live end-to-end (setup `tools` ->
+  `toolCall` -> `toolResponse` -> audio + `turnComplete`) against `models/gemini-3.1-flash-live-preview`
+  — full JSON shapes, the "model won't call the tool without an explicit systemInstruction telling
+  it to" gotcha, and the wiring steps are all in **`docs/gemini-tools.md`**.
+- Tests: `knowledge/ExaKnowledgeTest`, `knowledge/OpenAiKnowledgeTest`,
+  `knowledge/CompositeHealthKnowledgeTest` (MockWebServer, 18 cases total) + live-gated
+  `gemini/LiveToolCallSmokeTest` (same `-PliveSmoke=true` convention as `GeminiLiveSmokeTest`).
+  All pass; `./gradlew testDebugUnitTest assembleDebug lint` green.
