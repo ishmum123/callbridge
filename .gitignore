@@ -11,6 +11,10 @@ captures/
 .externalNativeBuild/
 .cxx/
 
+# CMake / NDK
+CMakeCache.txt
+CMakeFiles/
+
 # IDE
 .idea/
 *.iml
