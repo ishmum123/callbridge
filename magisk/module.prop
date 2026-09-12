@@ -1,0 +1,6 @@
+id=callbridge
+name=CallBridge
+version=v0.1.0-m0
+versionCode=1
+author=callbridge
+description=Installs CallBridge as a priv-app so it can hold CAPTURE_AUDIO_OUTPUT, MODIFY_PHONE_STATE, MODIFY_AUDIO_ROUTING and other signature|privileged permissions (spec §5).

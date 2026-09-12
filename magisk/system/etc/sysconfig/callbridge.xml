@@ -1,0 +1,5 @@
+<!-- Optional (spec §5): let CallBridge keep running during Doze/power-save so the InCallService
+     and foreground bridge session aren't throttled while waiting for calls. -->
+<config>
+  <allow-in-power-save package="bd.callbridge"/>
+</config>
