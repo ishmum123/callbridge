@@ -41,7 +41,7 @@ Route priority is now: **A2 (call-redirection) → B (telephony-tx preferred dev
 
 ## Device facts (phone: SM-G781B / r8q)
 
-- **LineageOS 23.2, Android 16, SDK 36** (NOT One UI — spec assumed One UI 13). Root via LineageOS "Rooted debugging": `adb root` → uid 0; `adb remount` → /system overlayfs rw (harmless vbmeta error).
+- **LineageOS 23.2, Android 16, SDK 36** (NOT One UI — spec assumed One UI 13). Root via LineageOS "Rooted debugging": `adb root` → uid 0; `adb remount` → /system overlayfs rw.
 - **Reboot loses the /system overlay** (files survive in /cache but aren't remounted). After every reboot: `adb root && adb remount && adb shell stop && adb shell start`. The debug APK also installs cleanly as a normal app via `adb install -r` for iteration; priv-app placement is only needed for the signature|privileged perms.
 - **Phone must be unlocked (RUNNING_UNLOCKED)** before any app launches — remove the lock screen on the pilot device for unattended running.
 - SIM: Robi, LTE. HAL confirms `voice_tx` (flag-free) and `incall_music_uplink` mixPorts route to `Telephony Tx`; both incall-rec uplink/downlink capture paths exist.
