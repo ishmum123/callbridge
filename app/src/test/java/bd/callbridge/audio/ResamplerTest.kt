@@ -2,9 +2,10 @@ package bd.callbridge.audio
 
 import kotlin.math.PI
 import kotlin.math.abs
+import kotlin.math.cos
 import kotlin.math.log10
+import kotlin.math.roundToInt
 import kotlin.math.sin
-import kotlin.math.sqrt
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -16,37 +17,43 @@ class ResamplerTest {
         return ShortArray(n) { i -> (amplitude * sin(2.0 * PI * freqHz * i / rate)).toInt().toShort() }
     }
 
-    /** Best-lag cross-correlation alignment, then SNR of (aligned expected - actual). */
-    private fun snrDb(actual: ShortArray, expectedRate: Int, freqHz: Double, amplitude: Double, maxLagSearch: Int = 80): Double {
-        // Skip the filter's warm-up/settle region at both ends.
-        val skip = 100
-        val core = actual.copyOfRange(skip, actual.size - skip)
-
-        var bestLag = 0
-        var bestScore = Double.NEGATIVE_INFINITY
-        for (lag in -maxLagSearch..maxLagSearch) {
-            var score = 0.0
-            for (i in core.indices) {
-                val t = i + skip + lag
-                val expected = amplitude * sin(2.0 * PI * freqHz * t / expectedRate)
-                score += core[i] * expected
-            }
-            if (score > bestScore) {
-                bestScore = score
-                bestLag = lag
-            }
+    /**
+     * Phase-independent THD+N-style SNR: fundamental-bin energy vs. everything else (harmonics,
+     * aliasing, resampling noise), measured via a direct DFT over a window spanning an exact
+     * integer number of [freqHz] cycles at [outRate] — no lag search / correlation alignment
+     * needed, since a magnitude-only bin comparison doesn't care about the signal's phase.
+     *
+     * [freqHz] and [outRate] must divide evenly (true for all frequencies/rates used below) so
+     * the window length is an exact integer number of samples and the fundamental lands exactly
+     * on bin [cycles] with zero spectral leakage.
+     */
+    private fun snrDb(actual: ShortArray, outRate: Int, freqHz: Double, skip: Int = 200, cycles: Int = 100): Double {
+        val periodSamples = outRate / freqHz
+        require(periodSamples == periodSamples.roundToInt().toDouble()) {
+            "freqHz=$freqHz must evenly divide outRate=$outRate for an integer-cycle DFT window"
         }
-
-        var signalEnergy = 0.0
-        var noiseEnergy = 0.0
-        for (i in core.indices) {
-            val t = i + skip + bestLag
-            val expected = amplitude * sin(2.0 * PI * freqHz * t / expectedRate)
-            val err = core[i] - expected
-            signalEnergy += expected * expected
-            noiseEnergy += err * err
+        val n = periodSamples.roundToInt() * cycles
+        require(actual.size >= skip + n) {
+            "not enough samples for a $cycles-cycle window: need ${skip + n}, got ${actual.size}"
         }
-        return 10.0 * log10(signalEnergy / noiseEnergy.coerceAtLeast(1e-9))
+        val window = actual.copyOfRange(skip, skip + n)
+
+        var totalEnergy = 0.0
+        for (v in window) totalEnergy += v.toDouble() * v.toDouble()
+        val totalEnergyFreqDomain = n.toDouble() * totalEnergy // Parseval: sum|X[k]|^2 = n * sum x[i]^2
+
+        val k = cycles // exact fundamental bin: freqHz * n / outRate == cycles
+        var re = 0.0
+        var im = 0.0
+        for (i in window.indices) {
+            val angle = 2.0 * PI * k * i / n
+            re += window[i] * cos(angle)
+            im -= window[i] * sin(angle)
+        }
+        // Real signal: energy at bin k mirrors bin (n-k); both count as "fundamental".
+        val fundamentalEnergy = 2.0 * (re * re + im * im)
+        val noiseEnergy = (totalEnergyFreqDomain - fundamentalEnergy).coerceAtLeast(1e-9)
+        return 10.0 * log10(fundamentalEnergy / noiseEnergy)
     }
 
     @Test
@@ -61,8 +68,8 @@ class ResamplerTest {
             abs(output.size - expectedLen) <= 70,
         )
 
-        val snr = snrDb(output, 16000, 1000.0, 8000.0)
-        assertTrue("SNR too low: $snr dB", snr > 30.0)
+        val snr = snrDb(output, 16000, 1000.0)
+        assertTrue("SNR too low: $snr dB", snr > 60.0)
     }
 
     @Test
@@ -77,8 +84,8 @@ class ResamplerTest {
             abs(output.size - expectedLen) <= 70,
         )
 
-        val snr = snrDb(output, 8000, 1000.0, 8000.0)
-        assertTrue("SNR too low: $snr dB", snr > 25.0)
+        val snr = snrDb(output, 8000, 1000.0)
+        assertTrue("SNR too low: $snr dB", snr > 60.0)
     }
 
     @Test
@@ -93,8 +100,8 @@ class ResamplerTest {
             abs(output.size - expectedLen) <= 70,
         )
 
-        val snr = snrDb(output, 16000, 1000.0, 8000.0)
-        assertTrue("SNR too low: $snr dB", snr > 28.0)
+        val snr = snrDb(output, 16000, 1000.0)
+        assertTrue("SNR too low: $snr dB", snr > 60.0)
     }
 
     @Test
@@ -143,7 +150,7 @@ class ResamplerTest {
         val up = Resampler(16000, 24000).let { it.process(input) + it.process(ShortArray(0)) }
         val down = Resampler(24000, 16000).let { it.process(up) + it.process(ShortArray(0)) }
 
-        val snr = snrDb(down, 16000, 1000.0, 8000.0)
-        assertTrue("round-trip SNR too low: $snr dB", snr > 25.0)
+        val snr = snrDb(down, 16000, 1000.0)
+        assertTrue("round-trip SNR too low: $snr dB", snr > 50.0)
     }
 }

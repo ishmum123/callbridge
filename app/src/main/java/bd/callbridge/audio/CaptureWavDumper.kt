@@ -13,17 +13,27 @@ import java.nio.ByteOrder
  * pulled off the phone and listened to, to judge quality and which side(s) of the call
  * [VoiceCallCapture] is actually receiving. Not wired into the default pipeline; pass an
  * instance to [VoiceCallCapture] to enable it.
+ *
+ * [start]/[write]/[stop] are `@Synchronized`: [write] runs on the capture read thread while
+ * [start]/[stop] can be called from a caller/lifecycle thread, so all three need to agree on
+ * `raf`'s state rather than just publishing it `@Volatile`.
  */
 class CaptureWavDumper(
     private val context: Context,
     private val sampleRateHz: Int = 8000,
+    /** Stop accepting writes once the file would exceed this size, to bound on-device storage
+     *  use for what's meant to be a short debugging capture, not a full-call archive. */
+    private val maxFileSizeBytes: Long = DEFAULT_MAX_FILE_SIZE_BYTES,
 ) {
     private var raf: RandomAccessFile? = null
     private var dataBytesWritten: Long = 0
+    private var cappedLogged = false
 
+    @get:Synchronized
     val isActive: Boolean get() = raf != null
 
     /** Opens a new WAV file and writes a placeholder header. Idempotent while already active. */
+    @Synchronized
     fun start() {
         if (raf != null) return
         try {
@@ -33,6 +43,7 @@ class CaptureWavDumper(
             writeHeader(out, dataLength = 0)
             raf = out
             dataBytesWritten = 0
+            cappedLogged = false
             Log.i(TAG, "capture WAV dump started: ${file.absolutePath}")
         } catch (e: Exception) {
             Log.e(TAG, "failed to open capture WAV file", e)
@@ -40,13 +51,25 @@ class CaptureWavDumper(
         }
     }
 
-    /** Appends mono PCM16 samples (little-endian) to the open file. No-op if not started. */
+    /** Appends mono PCM16 samples (little-endian) to the open file. No-op if not started or once
+     *  [maxFileSizeBytes] has been reached. */
+    @Synchronized
     fun write(pcm: ShortArray) {
         val out = raf ?: return
+        if (HEADER_BYTES + dataBytesWritten >= maxFileSizeBytes) {
+            if (!cappedLogged) {
+                Log.w(TAG, "capture WAV reached ${maxFileSizeBytes}B cap; dropping further writes")
+                cappedLogged = true
+            }
+            return
+        }
         try {
-            val bytes = ByteArray(pcm.size * 2)
+            val budget = (maxFileSizeBytes - HEADER_BYTES - dataBytesWritten).coerceAtLeast(0)
+            val bytesToWrite = minOf((pcm.size * 2).toLong(), budget).toInt()
+            val samplesToWrite = bytesToWrite / 2
+            val bytes = ByteArray(samplesToWrite * 2)
             val bb = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN)
-            for (s in pcm) bb.putShort(s)
+            for (i in 0 until samplesToWrite) bb.putShort(pcm[i])
             out.write(bytes)
             dataBytesWritten += bytes.size
         } catch (e: Exception) {
@@ -55,6 +78,7 @@ class CaptureWavDumper(
     }
 
     /** Finalizes the header with the real data length and closes the file. */
+    @Synchronized
     fun stop() {
         val out = raf ?: return
         try {
@@ -65,13 +89,14 @@ class CaptureWavDumper(
         } finally {
             raf = null
             dataBytesWritten = 0
+            cappedLogged = false
         }
     }
 
     private fun writeHeader(out: RandomAccessFile, dataLength: Long) {
         val byteRate = sampleRateHz * CHANNELS * BITS_PER_SAMPLE / 8
         val blockAlign = CHANNELS * BITS_PER_SAMPLE / 8
-        val header = ByteBuffer.allocate(44).order(ByteOrder.LITTLE_ENDIAN)
+        val header = ByteBuffer.allocate(HEADER_BYTES).order(ByteOrder.LITTLE_ENDIAN)
         header.put("RIFF".toByteArray())
         header.putInt((36 + dataLength).toInt())
         header.put("WAVE".toByteArray())
@@ -93,5 +118,7 @@ class CaptureWavDumper(
         private const val TAG = "CaptureWavDumper"
         private const val CHANNELS = 1
         private const val BITS_PER_SAMPLE = 16
+        private const val HEADER_BYTES = 44
+        const val DEFAULT_MAX_FILE_SIZE_BYTES: Long = 50L * 1024 * 1024
     }
 }

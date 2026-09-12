@@ -8,7 +8,10 @@ import android.util.Log
 import bd.callbridge.Config
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
+import kotlinx.coroutines.flow.asStateFlow
 
 /**
  * Concrete [AudioCapture] for M1a (spec §4.2): opens `AudioRecord` on the call's downlink at
@@ -21,10 +24,10 @@ import kotlinx.coroutines.flow.asSharedFlow
  * (mixed uplink+downlink) if the downlink-only source fails to initialize. Both require
  * `CAPTURE_AUDIO_OUTPUT` (signature|privileged) — this only works from the Magisk-installed
  * priv-app build (spec §5), not a plain debug install. `AudioRecord` init failure (missing
- * permission, source unsupported, wrong build) is reported via [isCapturing] staying false and
- * a logged error, not a crash.
+ * permission, source unsupported, wrong build) is reported via [state] going to
+ * [CaptureState.Failed] (and [isCapturing] staying false), not a crash.
  *
- * [start]/[stop] are idempotent.
+ * [start]/[stop] are `@Synchronized` and idempotent.
  */
 class VoiceCallCapture(
     private val context: Context,
@@ -41,13 +44,23 @@ class VoiceCallCapture(
     @Volatile
     private var running = false
 
+    /** Set by [stop] before unblocking the read thread, so the thread's own cleanup can tell a
+     *  requested stop apart from an unexpected read failure/thread death. */
+    @Volatile
+    private var stopRequested = false
+
     override val isCapturing: Boolean get() = running
+
+    private val _state = MutableStateFlow<CaptureState>(CaptureState.Idle)
+    override val state: StateFlow<CaptureState> = _state.asStateFlow()
 
     private val _frames = MutableSharedFlow<ShortArray>(extraBufferCapacity = 64)
     override val frames: Flow<ShortArray> = _frames.asSharedFlow()
 
+    @Synchronized
     override fun start() {
         if (running) return
+        stopRequested = false
 
         val minBufferBytes = AudioRecord.getMinBufferSize(
             CAPTURE_SAMPLE_RATE_HZ,
@@ -55,9 +68,14 @@ class VoiceCallCapture(
             AudioFormat.ENCODING_PCM_16BIT,
         )
         if (minBufferBytes <= 0) {
-            Log.e(TAG, "AudioRecord.getMinBufferSize failed ($minBufferBytes) for $CAPTURE_SAMPLE_RATE_HZ Hz")
+            val reason = "AudioRecord.getMinBufferSize failed ($minBufferBytes) for $CAPTURE_SAMPLE_RATE_HZ Hz"
+            Log.e(TAG, reason)
+            _state.value = CaptureState.Failed(reason)
             return
         }
+        // AudioRecord's internal ring stays generous (avoids overruns between our reads), but we
+        // read it in small fixed-size pieces below rather than draining the whole ring at once,
+        // to keep latency and worst-case overrun risk down.
         val bufferSizeBytes = minBufferBytes * 4
 
         var record = tryOpen(preferredSource, bufferSizeBytes)
@@ -67,68 +85,124 @@ class VoiceCallCapture(
             sourceUsed = fallbackSource
         }
         if (record == null) {
-            Log.e(TAG, "AudioRecord init failed for both preferred and fallback sources; not capturing")
+            val reason = "AudioRecord init failed for both preferred ($preferredSource) and fallback ($fallbackSource) sources"
+            Log.e(TAG, "$reason; not capturing")
+            _state.value = CaptureState.Failed(reason)
             return
         }
 
         audioRecord = record
-        running = true
         try {
             record.startRecording()
         } catch (e: IllegalStateException) {
-            Log.e(TAG, "AudioRecord.startRecording failed", e)
-            running = false
+            val reason = "AudioRecord.startRecording failed: ${e.message}"
+            Log.e(TAG, reason, e)
+            _state.value = CaptureState.Failed(reason)
             record.release()
             audioRecord = null
             return
         }
+        running = true
+        _state.value = CaptureState.Running
         wavDumper?.start()
         Log.i(TAG, "capture started (source=$sourceUsed, bufferBytes=$bufferSizeBytes)")
 
         val resampler = Resampler(CAPTURE_SAMPLE_RATE_HZ, outputSampleRateHz)
-        val readBuf = ShortArray(bufferSizeBytes / 2)
+        val readChunkSamples = (CAPTURE_SAMPLE_RATE_HZ * READ_CHUNK_MS / 1000)
+        val readBuf = ShortArray(readChunkSamples)
         readThread = Thread({
-            while (running) {
-                val n = try {
-                    record.read(readBuf, 0, readBuf.size)
-                } catch (e: Exception) {
-                    Log.e(TAG, "AudioRecord.read threw", e)
-                    break
+            var dropCount = 0L
+            var lastLogNanos = System.nanoTime()
+            try {
+                while (running) {
+                    val n = try {
+                        record.read(readBuf, 0, readBuf.size)
+                    } catch (e: Exception) {
+                        val reason = "AudioRecord.read threw: ${e.message}"
+                        Log.e(TAG, reason, e)
+                        _state.value = CaptureState.Failed(reason)
+                        break
+                    }
+                    if (n > 0) {
+                        val chunk = readBuf.copyOf(n)
+                        wavDumper?.write(chunk)
+                        val resampled = resampler.process(chunk)
+                        if (resampled.isNotEmpty() && !_frames.tryEmit(resampled)) {
+                            dropCount++
+                        }
+                        val now = System.nanoTime()
+                        if (now - lastLogNanos >= DROP_LOG_INTERVAL_NANOS) {
+                            if (dropCount > 0) {
+                                Log.w(TAG, "dropped $dropCount frame emissions in the last ~${DROP_LOG_INTERVAL_NANOS / 1_000_000_000}s (frames has no/slow collector)")
+                            }
+                            dropCount = 0
+                            lastLogNanos = now
+                        }
+                    } else if (n < 0) {
+                        val reason = "AudioRecord.read returned error code $n"
+                        Log.e(TAG, reason)
+                        _state.value = CaptureState.Failed(reason)
+                        break
+                    }
                 }
-                if (n > 0) {
-                    val chunk = readBuf.copyOf(n)
-                    wavDumper?.write(chunk)
-                    val resampled = resampler.process(chunk)
-                    if (resampled.isNotEmpty()) _frames.tryEmit(resampled)
-                } else if (n < 0) {
-                    Log.e(TAG, "AudioRecord.read returned error code $n")
-                    break
+            } finally {
+                // Whatever caused this loop to exit (normal stop(), a read error above, or the
+                // AudioRecord going bad), the capture is no longer running. Without this, a
+                // read-thread death that skipped the `break`'s Failed assignment (shouldn't
+                // happen given the two branches above, but keep this as the source of truth)
+                // would otherwise leave `running` stuck true forever, wedging start()/stop().
+                running = false
+                if (!stopRequested && _state.value !is CaptureState.Failed) {
+                    _state.value = CaptureState.Failed("capture read thread exited unexpectedly")
                 }
             }
         }, "VoiceCallCapture-read").apply { start() }
     }
 
+    @Synchronized
     override fun stop() {
-        if (!running) return
+        stopRequested = true
+        val record = audioRecord
+        val thread = readThread
+        if (record == null && thread == null) {
+            running = false
+            return
+        }
         running = false
-        readThread?.let {
+
+        // Stop the AudioRecord BEFORE joining: a read thread parked in AudioRecord.read() (the
+        // normal state at call teardown) only returns once the record is stopped. Joining first
+        // would block here while the thread blocks in the HAL, and a naive short-timeout join
+        // followed by release() would let this thread free the native AudioRecord out from under
+        // a read() that's still in flight -> native use-after-free / SIGSEGV.
+        record?.let {
             try {
-                it.join(500)
+                it.stop()
+            } catch (_: IllegalStateException) {
+                // Not recording; nothing to stop.
+            }
+        }
+
+        thread?.let {
+            try {
+                it.join(STOP_JOIN_TIMEOUT_MS)
+                if (it.isAlive) {
+                    Log.e(TAG, "read thread did not exit within ${STOP_JOIN_TIMEOUT_MS}ms of AudioRecord.stop(); leaking it and the AudioRecord rather than risking a use-after-free")
+                }
             } catch (_: InterruptedException) {
                 Thread.currentThread().interrupt()
             }
         }
-        readThread = null
-        audioRecord?.let { record ->
-            try {
-                record.stop()
-            } catch (_: IllegalStateException) {
-                // Not recording; nothing to stop.
-            }
-            record.release()
+
+        if (thread == null || !thread.isAlive) {
+            // Only release/null once we're sure nothing can still be touching it.
+            readThread = null
+            record?.release()
+            audioRecord = null
         }
-        audioRecord = null
+
         wavDumper?.stop()
+        if (_state.value !is CaptureState.Failed) _state.value = CaptureState.Idle
         Log.i(TAG, "capture stopped")
     }
 
@@ -159,5 +233,15 @@ class VoiceCallCapture(
     companion object {
         private const val TAG = "VoiceCallCapture"
         private const val CAPTURE_SAMPLE_RATE_HZ = 8000
+
+        /** Read granularity: fixed 20 ms pieces rather than draining the whole (4x-min) ring in
+         *  one read, to keep latency and overrun risk down (spec §4.2). */
+        private const val READ_CHUNK_MS = 20
+
+        /** How long [stop] waits for the read thread to notice [AudioRecord.stop] and exit
+         *  before giving up and leaking rather than releasing out from under it. */
+        private const val STOP_JOIN_TIMEOUT_MS = 5000L
+
+        private const val DROP_LOG_INTERVAL_NANOS = 5_000_000_000L
     }
 }
