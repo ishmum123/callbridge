@@ -59,6 +59,8 @@ class ProfileSummarizer(
         .callTimeout(CALL_TIMEOUT_SECONDS, TimeUnit.SECONDS)
         .build(),
     private val nowMs: () -> Long = System::currentTimeMillis,
+    /** Backoff before each attempt (first entry is the initial attempt). Tests pass a single 0. */
+    private val retryBackoffsMs: List<Long> = listOf(0L, 3_000L, 8_000L),
 ) {
     /**
      * @param force Bypasses the idempotency check (a [ProfileUpdateEntity] row already existing
@@ -101,7 +103,7 @@ class ProfileSummarizer(
         // Retry: the call ends right as the phone's default network flips (Wi-Fi ↔ LTE), and the
         // first attempt often times out on slow venue networks (observed 2026-09-12).
         var callResult: Result<String> = Result.failure(IllegalStateException("not attempted"))
-        for ((attempt, backoffMs) in listOf(0L, 3_000L, 8_000L).withIndex()) {
+        for ((attempt, backoffMs) in retryBackoffsMs.withIndex()) {
             if (backoffMs > 0) kotlinx.coroutines.delay(backoffMs)
             callResult = runCatching { callGenerateContent(requestJson) }
             if (callResult.isSuccess) break

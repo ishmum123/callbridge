@@ -111,6 +111,7 @@ class ProfileSummarizerTest {
             profileUpdateDao = updateDao,
             apiKey = { "test-key" },
             modelId = "gemini-2.5-flash",
+            retryBackoffsMs = listOf(0L),
             client = redirecting,
         )
     }
