@@ -6,6 +6,7 @@ import android.telecom.Call
 import android.telecom.VideoProfile
 import android.telephony.SmsManager
 import android.util.Log
+import bd.callbridge.Config
 import bd.callbridge.store.CallerRepository
 import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
@@ -74,7 +75,7 @@ class CallController(
         execute(ringActions, null)
 
         scope.launch {
-            val isRegistered = callerRepository.isRegistered(number)
+            val isRegistered = Config.ANSWER_UNREGISTERED_CALLERS || callerRepository.isRegistered(number)
             val actions = stateMachine.onCallerLookupResult(isRegistered)
             logIfIllegal()
             execute(actions, call)

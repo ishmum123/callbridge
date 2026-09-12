@@ -26,6 +26,12 @@ object Config {
     /** Seconds to wait after rejecting an unknown caller before calling back (spec §3, §4.1). */
     const val CALLBACK_DELAY_SECONDS: Long = 2L
 
+    /**
+     * Demo/hackathon policy: answer every caller immediately instead of the spec §3
+     * reject-then-callback flow for unregistered numbers. Set false for the shop pilot.
+     */
+    const val ANSWER_UNREGISTERED_CALLERS: Boolean = true
+
     const val CAPTURE_SAMPLE_RATE_HZ: Int = 16_000
     const val GEMINI_OUTPUT_SAMPLE_RATE_HZ: Int = 24_000
 }
