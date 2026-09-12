@@ -243,6 +243,12 @@ class BridgeSession(
             }
 
             LiveSessionEvent.TurnComplete, LiveSessionEvent.Interrupted -> {
+                if (event is LiveSessionEvent.Interrupted) {
+                    // Server-side barge-in (GEMINI_VAD): Gemini decided the caller spoke over the
+                    // model; drop whatever reply audio is still queued in the injector.
+                    Log.i(TAG, "server Interrupted -> injector.flush()")
+                    runCatching { injector.flush() }.onFailure { Log.w(TAG, "injector.flush() on Interrupted threw", it) }
+                }
                 isModelSpeaking = false
                 suppressStaleAudio = false
                 firstAudioLogged = false
@@ -282,7 +288,9 @@ class BridgeSession(
             VadGate.Event.SpeechStarted -> {
                 lastSpeechEndedAtMs = null
                 firstAudioLogged = false
-                if (isModelSpeaking) {
+                if (isModelSpeaking && vadMode == VadMode.LOCAL_VAD) {
+                    // Under GEMINI_VAD barge-in is the server's call (see Interrupted above); the
+                    // local energy gate is too trigger-happy (short "জী"/"হ্যাঁ" cut the greeting).
                     Log.i(TAG, "barge-in: caller speech while model speaking -> interrupt()+flush()")
                     // interrupt() already sends the manual activityStart signal under
                     // LOCAL_VAD (see LiveSession.interrupt's doc) — do not also call
@@ -414,7 +422,7 @@ object BridgeSessionFactory {
         onHangupRequested: suspend () -> Unit,
         onStatus: (BridgeStatus) -> Unit = {},
     ): BridgeSession {
-        val vadMode = VadMode.LOCAL_VAD
+        val vadMode = Config.vadMode
         val liveSession = GeminiLiveSession(
             authProvider = ApiKeyAuth(Config.geminiApiKey),
             vadMode = vadMode,
