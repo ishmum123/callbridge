@@ -225,6 +225,7 @@ class BridgeSessionTest {
         onHangupRequested = onHangupRequested,
         onStatus = { statuses.add(it) },
         drainTimeoutMs = drainTimeoutMs,
+        hangupIgnoreWindowMs = 0L,
         // Dispatchers.IO would be a real thread pool the virtual-time test dispatcher can't
         // control; keep everything on the test dispatcher so runCurrent()/advanceUntilIdle() see
         // every side effect deterministically — same reasoning applies to toolLookupDispatcher.
@@ -425,6 +426,7 @@ class BridgeSessionTest {
             scope = realScope,
             onHangupRequested = { hangupCalls++ },
             drainTimeoutMs = 150L,
+            hangupIgnoreWindowMs = 0L,
         )
 
         session.start()

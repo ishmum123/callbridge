@@ -122,6 +122,8 @@ class BridgeSession(
      *  hanging up anyway, and (separately) how long [open] is allowed to take before [start]
      *  gives up. */
     private val drainTimeoutMs: Long = 4_000L,
+    /** Closing phrase seen within this window after ACTIVE is treated as part of the greeting. */
+    private val hangupIgnoreWindowMs: Long = HANGUP_IGNORE_WINDOW_MS,
     /** [LiveSessionEvent.AudioOut] handling — including the potentially-blocking
      *  [Injector.write] — runs on this dispatcher rather than [scope]'s own (code review fix:
      *  a blocking AudioTrack/injector write must not tie up a shared Dispatchers.Default thread). */
@@ -436,7 +438,7 @@ class BridgeSession(
      *  well before the matching audio is done generating). */
     private fun onHangupPhraseDetected() {
         val sinceActive = nowMs() - activeAtMs
-        if (sinceActive < HANGUP_IGNORE_WINDOW_MS) {
+        if (sinceActive < hangupIgnoreWindowMs) {
             // Observed on device (15:10 call): the model appended the closing phrase to its own
             // greeting, which hung up a 10 s call. Never treat the phrase as a hangup this early.
             Log.w(TAG, "hangup phrase in transcript ${sinceActive}ms after ACTIVE — ignored (greeting window)")
