@@ -23,6 +23,7 @@ import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import okhttp3.OkHttpClient
@@ -63,6 +64,10 @@ class GeminiLiveSession(
     private val modelId: String = bd.callbridge.Config.GEMINI_MODEL_ID,
     private val voiceName: String = "Sulafat",
     private val languageCode: String = "bn-IN",
+    /** Function-calling tools to declare in the setup message (`docs/gemini-tools.md`). Empty by
+     *  default so sessions that don't need tools send the same setup shape as before this param
+     *  existed — see [SetupConfig.tools]'s `@EncodeDefault(NEVER)`. */
+    private val tools: List<FunctionDeclaration> = emptyList(),
     private val client: OkHttpClient = defaultClient,
     private val scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Default),
     private val watchdogTimeoutMs: Long = 8_000L,
@@ -141,6 +146,7 @@ class GeminiLiveSession(
                     ),
                     activityHandling = "START_OF_ACTIVITY_INTERRUPTS",
                 ),
+                tools = if (tools.isNotEmpty()) listOf(Tool(functionDeclarations = tools)) else emptyList(),
             ),
         )
         send(json.encodeToString(setup))
@@ -194,6 +200,19 @@ class GeminiLiveSession(
         if (vadMode != VadMode.LOCAL_VAD) return
         armResponseWatchdog()
         send(json.encodeToString(RealtimeInputEnvelope(RealtimeInputPayload(activityEnd = JsonObject(emptyMap())))))
+    }
+
+    override suspend fun sendToolResponse(id: String, name: String, response: JsonObject) {
+        send(
+            json.encodeToString(
+                ToolResponseEnvelope(ToolResponsePayload(listOf(FunctionResponse(id = id, name = name, response = response)))),
+            ),
+        )
+        // The tool response is itself a resumed "response outstanding" state: the model may now
+        // go on to speak/answer, or (in principle) call another tool. Re-arm so a model that never
+        // follows up after our answer is still caught by the watchdog (see class doc "Watchdog
+        // semantics" and the toolCall pause in handleToolCall/onServerText).
+        armResponseWatchdog()
     }
 
     override fun interrupt() {
@@ -252,6 +271,18 @@ class GeminiLiveSession(
         }
     }
 
+    /**
+     * Stops the response-watchdog timer without clearing [responseOutstanding] — used while a
+     * [LiveSessionEvent.ToolCall] lookup is in flight: the model is legitimately silent waiting on
+     * *our* [sendToolResponse], so the clock must not keep running against it, but the session is
+     * still conceptually "awaiting a model response" for [handleServerContent]'s GEMINI_VAD arm
+     * check. [sendToolResponse] (or [disarmResponseWatchdog] on cancellation) resumes/clears it.
+     */
+    private fun pauseResponseWatchdog() {
+        responseWatchdogJob?.cancel()
+        responseWatchdogJob = null
+    }
+
     private fun disarmResponseWatchdog() {
         responseOutstanding = false
         audioSentSinceTurn.set(false)
@@ -304,7 +335,36 @@ class GeminiLiveSession(
             scope.launch { close() }
             return
         }
+        obj["toolCall"]?.jsonObject?.let { handleToolCall(it); return }
+        obj["toolCallCancellation"]?.jsonObject?.let { handleToolCallCancellation(it); return }
         obj["serverContent"]?.jsonObject?.let { handleServerContent(it) }
+    }
+
+    /** Parses a server `toolCall` (`docs/gemini-tools.md`) and emits one [LiveSessionEvent.ToolCall]
+     *  per entry in `functionCalls[]`. Pauses the response watchdog for the duration of the
+     *  lookup (see [pauseResponseWatchdog]) — the model going silent while we look the answer up
+     *  is expected, not a hang. */
+    private fun handleToolCall(tc: JsonObject) {
+        pauseResponseWatchdog()
+        val calls = tc["functionCalls"]?.jsonArray ?: return
+        for (callEl in calls) {
+            val call = callEl.jsonObject
+            // Field order in the wild is name, args, id (not the reference doc's abstract order)
+            // — parsed by key, not position (docs/gemini-tools.md).
+            val name = call["name"]?.jsonPrimitive?.contentOrNull ?: continue
+            val id = call["id"]?.jsonPrimitive?.contentOrNull ?: continue
+            val args = call["args"]?.jsonObject ?: JsonObject(emptyMap())
+            emitChecked(LiveSessionEvent.ToolCall(id, name, args))
+        }
+    }
+
+    /** Parses a server `toolCallCancellation` and clears the response watchdog fully (same
+     *  treatment as [LiveSessionEvent.Interrupted] — see `docs/gemini-tools.md`): whatever we were
+     *  waiting to answer no longer matters. */
+    private fun handleToolCallCancellation(tcc: JsonObject) {
+        val ids = tcc["ids"]?.jsonArray?.mapNotNull { it.jsonPrimitive.contentOrNull } ?: emptyList()
+        disarmResponseWatchdog()
+        emitChecked(LiveSessionEvent.ToolCallCancelled(ids))
     }
 
     private fun handleServerContent(sc: JsonObject) {

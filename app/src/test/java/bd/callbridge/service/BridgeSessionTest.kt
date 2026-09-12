@@ -11,6 +11,9 @@ import bd.callbridge.gemini.LiveSessionEvent
 import bd.callbridge.gemini.SessionTerminalState
 import bd.callbridge.gemini.TranscriptRecorder
 import bd.callbridge.gemini.VadMode
+import bd.callbridge.knowledge.HealthKnowledge
+import bd.callbridge.knowledge.KnowledgeAnswer
+import bd.callbridge.knowledge.noInformationAvailable
 import bd.callbridge.store.CallDirection
 import bd.callbridge.store.CallEntity
 import bd.callbridge.store.TurnEntity
@@ -36,6 +39,12 @@ import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.put
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -53,6 +62,7 @@ private class FakeLiveSession : LiveSession {
     var activityStartCount = 0
     var activityEndCount = 0
     var interruptCount = 0
+    val toolResponses = mutableListOf<Triple<String, String, JsonObject>>()
 
     /** When set, [open] suspends on this instead of returning immediately — used to simulate a
      *  slow/hanging network open for the "stop while opening" test. */
@@ -92,6 +102,11 @@ private class FakeLiveSession : LiveSession {
     override fun interrupt() {
         interruptCount++
         callLog += "interrupt"
+    }
+
+    override suspend fun sendToolResponse(id: String, name: String, response: JsonObject) {
+        toolResponses.add(Triple(id, name, response))
+        callLog += "toolResponse:$id"
     }
 
     override val events: Flow<LiveSessionEvent> get() = eventsFlow
@@ -136,6 +151,25 @@ private class FakeInjector(
     override fun probe(): RouteProbe = RouteProbe(route, deviceFound = true, preferredDeviceSet = true, detail = "fake")
 }
 
+/** Records every [lookup] call; [answer] can be a fixed result, or [shouldThrow] to exercise the
+ *  "lookup failure still sends a no-info response" path even though real implementations never
+ *  throw. [gate], when set, suspends [lookup] until the test completes it — used to test
+ *  cancellation racing an in-flight lookup. */
+private class FakeHealthKnowledge(
+    private val answer: KnowledgeAnswer = KnowledgeAnswer("fake answer", listOf("http://example.com"), "fake"),
+    private val shouldThrow: Boolean = false,
+) : HealthKnowledge {
+    val calls = mutableListOf<Pair<String, String?>>()
+    var gate: CompletableDeferred<Unit>? = null
+
+    override suspend fun lookup(question: String, callerContext: String?): KnowledgeAnswer {
+        calls.add(question to callerContext)
+        gate?.await()
+        if (shouldThrow) throw RuntimeException("fake lookup failure")
+        return answer
+    }
+}
+
 private class FakeTurnDao : TurnDao {
     val inserted = mutableListOf<TurnEntity>()
     override suspend fun insert(turn: TurnEntity): Long {
@@ -174,6 +208,8 @@ class BridgeSessionTest {
         onHangupRequested: suspend () -> Unit = {},
         statuses: MutableList<BridgeStatus> = mutableListOf(),
         drainTimeoutMs: Long = 4_000L,
+        healthKnowledge: HealthKnowledge? = null,
+        callerContextSummary: String? = null,
     ) = BridgeSession(
         liveSession = liveSession,
         injector = injector,
@@ -191,8 +227,11 @@ class BridgeSessionTest {
         drainTimeoutMs = drainTimeoutMs,
         // Dispatchers.IO would be a real thread pool the virtual-time test dispatcher can't
         // control; keep everything on the test dispatcher so runCurrent()/advanceUntilIdle() see
-        // every side effect deterministically.
+        // every side effect deterministically — same reasoning applies to toolLookupDispatcher.
         injectorDispatcher = StandardTestDispatcher(scope.testScheduler),
+        healthKnowledge = healthKnowledge,
+        callerContextSummary = callerContextSummary,
+        toolLookupDispatcher = StandardTestDispatcher(scope.testScheduler),
     )
 
     @Test
@@ -488,5 +527,103 @@ class BridgeSessionTest {
 
         assertEquals(1, liveSession.textTurns.size)
         assertTrue(liveSession.activityStartCount == 0 && liveSession.activityEndCount == 0)
+    }
+
+    @Test
+    fun `ToolCall for lookup_health_info runs the lookup and sends a toolResponse with the same id`() = runTest(StandardTestDispatcher()) {
+        val liveSession = FakeLiveSession()
+        val injector = FakeInjector()
+        val health = FakeHealthKnowledge(answer = KnowledgeAnswer("Paracetamol 10-15mg/kg", listOf("src1", "src2"), "exa"))
+        val session = buildSession(this, liveSession, injector, healthKnowledge = health, callerContextSummary = "age 40")
+
+        session.start()
+        runCurrent()
+
+        liveSession.eventsFlow.emit(
+            LiveSessionEvent.ToolCall(
+                id = "fc_1",
+                name = "lookup_health_info",
+                args = buildJsonObject { put("question", "paracetamol dose for 2yo") },
+            ),
+        )
+        runCurrent()
+        advanceUntilIdle()
+
+        assertEquals(listOf("paracetamol dose for 2yo" to "age 40"), health.calls)
+        assertEquals(1, liveSession.toolResponses.size)
+        val (id, name, response) = liveSession.toolResponses[0]
+        assertEquals("fc_1", id)
+        assertEquals("lookup_health_info", name)
+        assertEquals("Paracetamol 10-15mg/kg", response["result"]!!.jsonPrimitive.content)
+        assertEquals(listOf("src1", "src2"), response["sources"]!!.jsonArray.map { it.jsonPrimitive.content })
+    }
+
+    @Test
+    fun `ToolCallCancelled drops a pending lookup without sending a toolResponse`() = runTest(StandardTestDispatcher()) {
+        val liveSession = FakeLiveSession()
+        val injector = FakeInjector()
+        val health = FakeHealthKnowledge()
+        health.gate = CompletableDeferred() // lookup never completes until we say so
+        val session = buildSession(this, liveSession, injector, healthKnowledge = health)
+
+        session.start()
+        runCurrent()
+
+        liveSession.eventsFlow.emit(
+            LiveSessionEvent.ToolCall(id = "fc_2", name = "lookup_health_info", args = JsonObject(mapOf("question" to JsonPrimitive("x")))),
+        )
+        runCurrent()
+
+        liveSession.eventsFlow.emit(LiveSessionEvent.ToolCallCancelled(listOf("fc_2")))
+        runCurrent()
+
+        // Let the lookup "finish" now (gate completes) — since it was cancelled, no toolResponse
+        // should ever be sent for it.
+        health.gate!!.complete(Unit)
+        advanceUntilIdle()
+
+        assertTrue("cancelled tool call must never get a toolResponse", liveSession.toolResponses.isEmpty())
+    }
+
+    @Test
+    fun `lookup failure still sends a no-info toolResponse so the model isn't left hanging`() = runTest(StandardTestDispatcher()) {
+        val liveSession = FakeLiveSession()
+        val injector = FakeInjector()
+        val health = FakeHealthKnowledge(shouldThrow = true)
+        val session = buildSession(this, liveSession, injector, healthKnowledge = health)
+
+        session.start()
+        runCurrent()
+
+        liveSession.eventsFlow.emit(
+            LiveSessionEvent.ToolCall(id = "fc_3", name = "lookup_health_info", args = JsonObject(mapOf("question" to JsonPrimitive("x")))),
+        )
+        runCurrent()
+        advanceUntilIdle()
+
+        assertEquals(1, liveSession.toolResponses.size)
+        val (id, _, response) = liveSession.toolResponses[0]
+        assertEquals("fc_3", id)
+        assertEquals(noInformationAvailable().answerEn, response["result"]!!.jsonPrimitive.content)
+    }
+
+    @Test
+    fun `ToolCall for an unrecognized function name still replies instead of hanging the model`() = runTest(StandardTestDispatcher()) {
+        val liveSession = FakeLiveSession()
+        val injector = FakeInjector()
+        // No healthKnowledge wired at all (e.g. a bug declaring a tool without a backend).
+        val session = buildSession(this, liveSession, injector, healthKnowledge = null)
+
+        session.start()
+        runCurrent()
+
+        liveSession.eventsFlow.emit(
+            LiveSessionEvent.ToolCall(id = "fc_4", name = "lookup_health_info", args = JsonObject(emptyMap())),
+        )
+        runCurrent()
+        advanceUntilIdle()
+
+        assertEquals(1, liveSession.toolResponses.size)
+        assertEquals("fc_4", liveSession.toolResponses[0].first)
     }
 }

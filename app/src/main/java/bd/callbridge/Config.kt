@@ -44,4 +44,13 @@ object Config {
 
     const val CAPTURE_SAMPLE_RATE_HZ: Int = 16_000
     const val GEMINI_OUTPUT_SAMPLE_RATE_HZ: Int = 24_000
+
+    /**
+     * Demo scope switch (2026-09-12): true selects the Bangla health-only persona
+     * ([bd.callbridge.gemini.HealthPromptBn] + `lookup_health_info` tool, wired in
+     * [bd.callbridge.service.BridgeSessionManager.buildSession]) instead of the general shop
+     * farming-assistant prompt ([bd.callbridge.gemini.SystemPromptBuilder]). Flip to false to go
+     * back to the original shop-assistant demo path without deleting it.
+     */
+    const val HEALTH_DEMO: Boolean = true
 }

@@ -1,5 +1,11 @@
 package bd.callbridge.gemini
 
+import kotlinx.serialization.json.add
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
+import kotlinx.serialization.json.putJsonArray
+import kotlinx.serialization.json.putJsonObject
+
 /**
  * System prompt for the health-only demo persona: a warm rural-Bangla helpline that answers only
  * health questions, always grounds factual medical answers in a `lookup_health_info` tool call
@@ -15,6 +21,27 @@ package bd.callbridge.gemini
  * (a caller-info line the model reads, not a hidden system field).
  */
 object HealthPromptBn {
+
+    /**
+     * The one function this prompt instructs the model to call before answering any factual
+     * medical question (see the "গুরুত্বপূর্ণ নিয়ম" bullet below and `docs/gemini-tools.md` for the
+     * verified wire shape). Declare this in [GeminiLiveSession]'s `tools` constructor param
+     * whenever [healthSystemPrompt] is used as the system instruction.
+     */
+    val lookupHealthInfoTool: FunctionDeclaration = FunctionDeclaration(
+        name = "lookup_health_info",
+        description = "Looks up evidence-based health information to answer the caller's medical question.",
+        parameters = buildJsonObject {
+            put("type", "object")
+            putJsonObject("properties") {
+                putJsonObject("question") {
+                    put("type", "string")
+                    put("description", "The caller's health question, restated in English.")
+                }
+            }
+            putJsonArray("required") { add("question") }
+        },
+    )
 
     /**
      * @param callerProfileSummary optional short caller context (e.g. "নাম করিম, গ্রাম বাগেরহাট,

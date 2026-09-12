@@ -4,14 +4,21 @@ import android.content.Context
 import bd.callbridge.CallBridgeApp
 import android.telecom.Call
 import android.util.Log
+import bd.callbridge.Config
+import bd.callbridge.BuildConfig
 import bd.callbridge.call.CallController
 import bd.callbridge.call.CallSessionCoordinator
 import bd.callbridge.gemini.CallerProfile
+import bd.callbridge.gemini.FunctionDeclaration
+import bd.callbridge.gemini.HealthPromptBn
 import bd.callbridge.gemini.SystemPromptBuilder
+import bd.callbridge.knowledge.CompositeHealthKnowledge
+import bd.callbridge.knowledge.HealthKnowledge
 import bd.callbridge.store.CallBridgeDatabase
 import bd.callbridge.store.CallDirection
 import bd.callbridge.store.CallEntity
 import bd.callbridge.store.CallerRepository
+import bd.callbridge.store.PatientProfileEntity
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
@@ -149,8 +156,29 @@ class BridgeSessionManager(
                 startedAt = startedAtMs,
             )
         )
-        val systemPrompt = SystemPromptBuilder.build(context, profile, SHOP_NAME)
         lastCallId = callId
+
+        // Health-demo scope switch (Config.HEALTH_DEMO): health-only Bangla persona + the
+        // lookup_health_info tool, grounded in the caller's existing patient-profile summary if
+        // one exists, instead of the general shop-assistant prompt (docs/gemini-tools.md).
+        val (systemPrompt, tools, healthKnowledge, callerContextSummary) = if (Config.HEALTH_DEMO) {
+            val patientProfileRepository = (context.applicationContext as? bd.callbridge.CallBridgeApp)?.profileRepository
+            val patient = patientProfileRepository?.find(number)
+            val summary = patientProfileSummary(patient)
+            HealthSessionInputs(
+                systemPrompt = HealthPromptBn.healthSystemPrompt(summary),
+                tools = listOf(HealthPromptBn.lookupHealthInfoTool),
+                healthKnowledge = CompositeHealthKnowledge.fromKeys(BuildConfig.EXA_API_KEY, BuildConfig.OPENAI_API_KEY),
+                callerContextSummary = summary,
+            )
+        } else {
+            HealthSessionInputs(
+                systemPrompt = SystemPromptBuilder.build(context, profile, SHOP_NAME),
+                tools = emptyList(),
+                healthKnowledge = null,
+                callerContextSummary = null,
+            )
+        }
 
         return BridgeSessionFactory.create(
             context = context,
@@ -163,7 +191,54 @@ class BridgeSessionManager(
             scope = scope,
             onHangupRequested = { controller?.hangUp() },
             onStatus = { _status.value = it },
+            tools = tools,
+            healthKnowledge = healthKnowledge,
+            callerContextSummary = callerContextSummary,
         )
+    }
+
+    /** Grouped return value for [buildSession]'s health-demo/shop-assistant branch — avoids a
+     *  4-way `Pair`-of-`Pair`s or four separate `var`s. */
+    private data class HealthSessionInputs(
+        val systemPrompt: String,
+        val tools: List<FunctionDeclaration>,
+        val healthKnowledge: HealthKnowledge?,
+        val callerContextSummary: String?,
+    )
+
+    /**
+     * Short Bangla+English caller-context line built from an existing [PatientProfileEntity]
+     * (demo "Patient profile" feature — see `store/ProfileRepository.kt`), for injection into
+     * [HealthPromptBn.healthSystemPrompt]. Null when there's no profile yet or nothing in it is
+     * populated (a brand-new/unknown caller).
+     */
+    private fun patientProfileSummary(patient: PatientProfileEntity?): String? {
+        if (patient == null) return null
+        val bn = mutableListOf<String>()
+        val en = mutableListOf<String>()
+        patient.displayName?.takeIf { it.isNotBlank() }?.let {
+            bn += "নাম $it"; en += "name $it"
+        }
+        patient.ageYears?.let {
+            bn += "বয়স আনুমানিক $it"; en += "age ~$it"
+        }
+        if (patient.chronicConditions.isNotEmpty()) {
+            bn += "রোগ: ${patient.chronicConditions.joinToString(", ")}"
+            en += "conditions: ${patient.chronicConditions.joinToString(", ")}"
+        }
+        if (patient.medications.isNotEmpty()) {
+            bn += "ওষুধ: ${patient.medications.joinToString(", ")}"
+            en += "meds: ${patient.medications.joinToString(", ")}"
+        }
+        if (patient.riskFlags.isNotEmpty()) {
+            bn += "ঝুঁকি চিহ্ন: ${patient.riskFlags.joinToString(", ")}"
+            en += "risk flags: ${patient.riskFlags.joinToString(", ")}"
+        }
+        patient.adviceGiven.lastOrNull()?.let {
+            bn += "সর্বশেষ পরামর্শ: $it"; en += "last advice: $it"
+        }
+        if (bn.isEmpty()) return null
+        return "${bn.joinToString("; ")} (${en.joinToString("; ")})"
     }
 
     private suspend fun stopCurrentSession(reason: String) {
