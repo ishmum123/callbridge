@@ -7,8 +7,11 @@ import android.telecom.VideoProfile
 import android.telephony.SmsManager
 import android.util.Log
 import bd.callbridge.store.CallerRepository
+import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
@@ -19,6 +22,11 @@ private const val BUSY_SMS_TEXT = "Sorry, we're on another call right now. We'll
  * Bridges [CallBridgeInCallService]'s Telecom [Call] callbacks to the pure [CallStateMachine]
  * and executes the [CallAction]s it returns (spec §4.1: answer/reject/disconnect/placeCall/SMS).
  *
+ * The state machine's transitions never throw (see its class doc); this controller is the layer
+ * that logs when Telecom delivers an event out of the expected order ([logIfIllegal]) instead of
+ * crashing the process, and it never lets an unhandled exception inside a launched coroutine kill
+ * the app either (see [exceptionHandler]).
+ *
  * M0 wires call control only. The Gemini bridge (M2/M3) hooks in by observing [CallStateMachine]
  * transitions (or a callback here) to open/close a [bd.callbridge.gemini.LiveSession] and start
  * [bd.callbridge.audio.AudioCapture] once a call reaches [CallState.ACTIVE].
@@ -27,74 +35,130 @@ class CallController(
     private val context: Context,
     private val callerRepository: CallerRepository,
     private val stateMachine: CallStateMachine = CallStateMachine(),
-    private val scope: CoroutineScope = CoroutineScope(Dispatchers.Default),
+    private val scope: CoroutineScope = CoroutineScope(
+        SupervisorJob() + Dispatchers.Default + CoroutineExceptionHandler { _, throwable ->
+            Log.w(TAG, "Unhandled exception in CallController scope", throwable)
+        },
+    ),
 ) {
     private var activeTelecomCall: Call? = null
+    private var callbackJob: Job? = null
+    private var lastLoggedIllegalTransition: String? = null
 
     val state: CallState get() = stateMachine.state
 
-    /** Called from [CallBridgeInCallService.onCallAdded] for a newly ringing/incoming call. */
+    /**
+     * Called from [CallBridgeInCallService.onCallAdded] for a call Telecom just handed us. This
+     * is either: a genuinely new ring, a second call while ACTIVE (busy+SMS), or - if we're
+     * [CallState.CALLING_BACK] - our own outbound callback leg connecting, which must NOT go
+     * through caller lookup/reject (it *is* the call we placed).
+     */
     fun onCallAdded(call: Call) {
         val number = call.details?.handle?.schemeSpecificPart ?: "unknown"
 
+        if (stateMachine.state == CallState.CALLING_BACK && isOutgoing(call)) {
+            activeTelecomCall = call
+            return
+        }
+
         if (stateMachine.state == CallState.ACTIVE) {
             val actions = stateMachine.onIncomingWhileActive(number)
+            logIfIllegal()
             execute(actions, call)
             return
         }
 
         activeTelecomCall = call
-        stateMachine.onIncomingRinging(number)
+        val ringActions = stateMachine.onIncomingRinging(number)
+        logIfIllegal()
+        execute(ringActions, null)
 
         scope.launch {
             val isRegistered = callerRepository.isRegistered(number)
             val actions = stateMachine.onCallerLookupResult(isRegistered)
+            logIfIllegal()
             execute(actions, call)
         }
     }
 
     /** Called from the InCallService when Telecom reports the call state changed to ACTIVE. */
     fun onTelecomCallActive() {
-        if (stateMachine.state == CallState.ANSWERED || stateMachine.state == CallState.REJECTED_FOR_CALLBACK) {
-            stateMachine.onCallActive()
+        val actions = stateMachine.onCallActive()
+        logIfIllegal()
+        execute(actions, activeTelecomCall)
+    }
+
+    /**
+     * Called from the InCallService on either `onCallRemoved` or
+     * `onStateChanged(STATE_DISCONNECTED)` - whichever fires first; idempotent, safe to call from
+     * both for the same call.
+     */
+    fun onCallRemoved() {
+        if (stateMachine.state == CallState.IDLE) return // already fully settled - no-op
+
+        val actions = stateMachine.onCallEnded()
+        logIfIllegal()
+        execute(actions, null)
+        activeTelecomCall = null
+
+        if (stateMachine.state == CallState.ENDED) {
+            val resetActions = stateMachine.reset()
+            logIfIllegal()
+            execute(resetActions, null)
         }
     }
 
-    /** Called from the InCallService when Telecom reports the call was disconnected. */
-    fun onCallRemoved() {
-        if (stateMachine.state == CallState.ACTIVE ||
-            stateMachine.state == CallState.ANSWERED ||
-            stateMachine.state == CallState.REJECTED_FOR_CALLBACK
-        ) {
-            stateMachine.onCallEnded()
-        }
-        activeTelecomCall = null
-        if (stateMachine.state == CallState.ENDED) stateMachine.reset()
+    /** Called from [CallBridgeInCallService.onDestroy] so a stale timer can't fire into a torn
+     *  down service. Does not cancel [scope] itself - [CallController] is a long-lived singleton
+     *  that outlives any one InCallService binding. */
+    fun onServiceDestroyed() {
+        cancelPendingCallback()
     }
 
     fun hangUp() {
+        cancelPendingCallback()
         activeTelecomCall?.disconnect()
     }
 
-    private fun execute(actions: List<CallAction>, call: Call) {
+    private fun execute(actions: List<CallAction>, call: Call?) {
         for (action in actions) {
             when (action) {
-                is CallAction.Answer -> call.answer(VideoProfile.STATE_AUDIO_ONLY)
-                is CallAction.Reject -> call.reject(false, null)
-                is CallAction.RejectBusy -> call.reject(false, null)
+                is CallAction.Answer -> call?.answer(VideoProfile.STATE_AUDIO_ONLY)
+                is CallAction.Reject -> call?.reject(false, null)
+                is CallAction.RejectBusy -> call?.reject(false, null)
                 is CallAction.SendBusySms -> sendSms(action.number, BUSY_SMS_TEXT)
                 is CallAction.ScheduleCallback -> scheduleCallback(action.number, action.delaySeconds)
                 is CallAction.PlaceCallback -> placeCall(action.number)
+                is CallAction.CancelPendingCallback -> cancelPendingCallback()
             }
         }
     }
 
     private fun scheduleCallback(number: String, delaySeconds: Long) {
-        scope.launch {
+        callbackJob?.cancel()
+        callbackJob = scope.launch {
             delay(delaySeconds * 1000)
             val actions = stateMachine.onCallbackTimerFired()
-            execute(actions, activeTelecomCall ?: return@launch)
+            logIfIllegal()
+            // No Call object needed/available here - PlaceCallback goes straight through
+            // TelecomManager (see placeCall below); that's the whole point of this being a
+            // separate action from Answer/Reject.
+            execute(actions, null)
         }
+    }
+
+    private fun cancelPendingCallback() {
+        callbackJob?.cancel()
+        callbackJob = null
+    }
+
+    /** Direction detection per spec/brief: `callDirection` is API 29+, always available here
+     *  (minSdk 33); state fallback covers the brief window before Telecom finishes classifying it. */
+    private fun isOutgoing(call: Call): Boolean {
+        val direction = call.details?.callDirection
+        return direction == Call.Details.DIRECTION_OUTGOING ||
+            call.state == Call.STATE_DIALING ||
+            call.state == Call.STATE_CONNECTING
     }
 
     private fun placeCall(number: String) {
@@ -112,6 +176,14 @@ class CallController(
             smsManager?.sendTextMessage(number, null, text, null, null)
         } catch (e: SecurityException) {
             Log.e(TAG, "sendSms failed for $number", e)
+        }
+    }
+
+    private fun logIfIllegal() {
+        val illegal = stateMachine.lastIllegalTransition
+        if (illegal != null && illegal != lastLoggedIllegalTransition) {
+            Log.w(TAG, "Ignored out-of-order call event: $illegal")
+            lastLoggedIllegalTransition = illegal
         }
     }
 }

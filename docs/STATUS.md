@@ -8,7 +8,7 @@ Last updated: 2026-09-12 (M0 scaffold commit).
 
 | Milestone | Status |
 |---|---|
-| M0 — Dialer skeleton | Code-complete, unit-tested. **Untested on a real device** (no phone attached during this build). |
+| M0 — Dialer skeleton | on device: install verified, priv perms granted, default dialer set, first inbound call reached InCallService; callback flow crash fixed (this change). |
 | M1a — Capture | Pending. Interfaces (`AudioCapture`) and package (`audio/`) exist; no implementation. |
 | M1b — Injection | Pending. `Injector` interface + `NoopInjector` + NDK/CMake toolchain proven (stub `nativeVersion()` JNI call); no real Route A/B/C implementation. |
 | M2 — Bridge | Pending. `LiveSession` interface + `UnimplementedLiveSession` stub exist; no OkHttp WebSocket client. |

@@ -28,3 +28,4 @@ CMakeFiles/
 *.jks
 .env
 secrets.properties
+.worktrees/

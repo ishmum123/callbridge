@@ -16,8 +16,12 @@ class CallBridgeInCallService : InCallService() {
 
     private val callCallback = object : Call.Callback() {
         override fun onStateChanged(call: Call, state: Int) {
-            if (state == Call.STATE_ACTIVE) {
-                callController.onTelecomCallActive()
+            when (state) {
+                Call.STATE_ACTIVE -> callController.onTelecomCallActive()
+                // Belt-and-suspenders end signal alongside onCallRemoved below - whichever fires
+                // first; CallController.onCallRemoved() is idempotent so calling it from both is
+                // safe (spec: never crash / never get stuck on out-of-order Telecom delivery).
+                Call.STATE_DISCONNECTED -> callController.onCallRemoved()
             }
         }
     }
@@ -32,5 +36,10 @@ class CallBridgeInCallService : InCallService() {
         super.onCallRemoved(call)
         call.unregisterCallback(callCallback)
         callController.onCallRemoved()
+    }
+
+    override fun onDestroy() {
+        callController.onServiceDestroyed()
+        super.onDestroy()
     }
 }
