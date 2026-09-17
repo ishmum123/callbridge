@@ -515,10 +515,24 @@ class BridgeSession(
         }
         Log.i(TAG, "phase=ENDED reason=$reason — tearing down")
         startJob?.cancelAndJoin()
-        val toJoin = jobs.toList()
-        jobs.clear()
-        toJoin.forEach { it.cancel() }
-        toJoin.joinAll()
+        // A single snapshot-then-join of `jobs` can race a job that adds a new entry (e.g.
+        // playWaitClip()/handleToolCall() launching a fresh `scope.launch` + `jobs +=`) between
+        // the snapshot and its own cancellation being observed — that straggler would never be
+        // joined, letting injector.close() below run concurrently with its in-flight
+        // injector.write() (code review fix: this was the actual cause of the wait-clip write
+        // racing close() and SIGSEGV'ing the process, even though jobs already looked "joined").
+        // Loop snapshot+cancel+join to a fixed point instead of a single pass.
+        var drainPasses = 0
+        while (jobs.isNotEmpty() && drainPasses < MAX_STOP_DRAIN_PASSES) {
+            val toJoin = jobs.toList()
+            jobs.removeAll(toJoin)
+            toJoin.forEach { it.cancel() }
+            toJoin.joinAll()
+            drainPasses++
+        }
+        if (jobs.isNotEmpty()) {
+            Log.e(TAG, "stop(): ${jobs.size} job(s) still queued after $MAX_STOP_DRAIN_PASSES drain passes; closing injector anyway")
+        }
         runCatching { injector.flush() }.onFailure { Log.w(TAG, "injector.flush() during teardown threw", it) }
         runCatching { injector.close() }.onFailure { Log.w(TAG, "injector.close() during teardown threw", it) }
         runCatching { liveSession.close() }.onFailure { Log.w(TAG, "liveSession.close() during teardown threw", it) }
@@ -613,6 +627,11 @@ object BridgeSessionFactory {
 
 private const val MODEL_IDLE_MS = 600L
 private const val HANGUP_IGNORE_WINDOW_MS = 15_000L
+
+/** Bound on [BridgeSession.stop]'s job-drain loop (fixed-point snapshot+cancel+join of [jobs]) —
+ *  should converge in 1-2 passes in practice; this is only a safety cap against a pathological
+ *  job that keeps relaunching children forever. */
+private const val MAX_STOP_DRAIN_PASSES = 20
 
 /** Reads a 16-bit PCM WAV from res/raw (44-byte canonical header assumed) into a ShortArray. */
 private fun loadRawWavPcm16(context: android.content.Context, resId: Int): ShortArray {

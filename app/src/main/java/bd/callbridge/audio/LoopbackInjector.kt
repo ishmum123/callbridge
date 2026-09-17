@@ -6,6 +6,8 @@ import android.media.AudioFormat
 import android.media.AudioManager
 import android.media.AudioTrack
 import android.util.Log
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.withLock
 
 /**
  * Route C (spec §4.3): plays straight to the device's default speaker/media output. Used only
@@ -19,13 +21,17 @@ class LoopbackInjector(@Suppress("UNUSED_PARAMETER") context: Context) : Injecto
     override val route: InjectorRoute = InjectorRoute.LOOPBACK
 
     override val openSampleRateHz: Int?
-        get() = if (track != null) SAMPLE_RATE_HZ else null
+        get() = lock.withLock { if (track != null) SAMPLE_RATE_HZ else null }
 
+    // See TelephonyTxInjector's [lock]/[closed] doc: same write-vs-release race category
+    // (write()/flush() on one thread, close() from BridgeSession.stop() on another), same fix.
+    private val lock = ReentrantLock()
     private var track: AudioTrack? = null
+    @Volatile private var closed = false
     private var lastDetail = "not opened yet"
 
-    override fun open() {
-        if (track != null) return
+    override fun open() = lock.withLock {
+        if (closed || track != null) return
         track = buildTrack().also {
             if (it == null) {
                 lastDetail = "AudioTrack construction failed at $SAMPLE_RATE_HZ Hz/mono"
@@ -72,18 +78,24 @@ class LoopbackInjector(@Suppress("UNUSED_PARAMETER") context: Context) : Injecto
         }
     }
 
-    override fun write(pcm: ShortArray) {
-        track?.write(pcm, 0, pcm.size)
+    override fun write(pcm: ShortArray) = lock.withLock {
+        if (closed) return
+        val activeTrack = track ?: return
+        activeTrack.write(pcm, 0, pcm.size)
+        Unit
     }
 
-    override fun flush() {
+    override fun flush() = lock.withLock {
+        if (closed) return
         val activeTrack = track ?: return
         activeTrack.pause()
         activeTrack.flush()
         activeTrack.play()
     }
 
-    override fun close() {
+    override fun close() = lock.withLock {
+        if (closed) return
+        closed = true
         track?.let {
             it.stop()
             it.release()
@@ -91,13 +103,15 @@ class LoopbackInjector(@Suppress("UNUSED_PARAMETER") context: Context) : Injecto
         track = null
     }
 
-    override fun probe(): RouteProbe = RouteProbe(
-        route = route,
-        deviceFound = true,
-        preferredDeviceSet = true,
-        routedDeviceId = track?.routedDevice?.id,
-        detail = lastDetail,
-    )
+    override fun probe(): RouteProbe = lock.withLock {
+        RouteProbe(
+            route = route,
+            deviceFound = true,
+            preferredDeviceSet = true,
+            routedDeviceId = track?.routedDevice?.id,
+            detail = lastDetail,
+        )
+    }
 
     companion object {
         private const val TAG = "LoopbackInjector"

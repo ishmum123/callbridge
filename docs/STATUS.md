@@ -324,3 +324,53 @@ orchestration layer).
   `knowledge/CompositeHealthKnowledgeTest` (MockWebServer, 18 cases total) + live-gated
   `gemini/LiveToolCallSmokeTest` (same `-PliveSmoke=true` convention as `GeminiLiveSmokeTest`).
   All pass; `./gradlew testDebugUnitTest assembleDebug lint` green.
+
+## Known issues / fixes — audio-track write-vs-release SIGSEGV (2026-09-17)
+
+**Crash**: two on-device tombstones (2026-09-12, 2026-09-17), identical native backtrace —
+`AudioTrack::releaseBuffer` (null deref) <- `AudioTrack::write` <- `TelephonyTxInjector.write` <-
+`BridgeSession$playWaitClip$job$1$1`. The wait-clip write job (fired on every tool-call lookup,
+spec §4.4) raced `BridgeSession.stop()` tearing the call down (barge-in / hangup / caller
+hanging up): `stop()` closed (`stop()`+`release()`) the injector's `AudioTrack` while that job's
+`write()` was still in flight on `injectorDispatcher`, and a native use-after-free took the whole
+`InCallService` process — and the live GSM call it was bridging — down with it.
+
+**Category**: any `AudioTrack`/`AudioRecord` method invoked after, or concurrently with, that
+object's `release()`, in any [Injector] implementation or capture class. Root cause had two
+layers:
+1. `TelephonyTxInjector`/`LoopbackInjector` had no synchronization at all between `write()`/
+   `flush()` (called from whichever dispatcher/thread the caller happens to use) and `close()`.
+2. `BridgeSession.stop()`'s job-drain (`jobs.toList()` -> cancel -> `joinAll()`) took a single
+   snapshot of the tracked-jobs list; a job that adds a *new* job mid-teardown (e.g.
+   `playWaitClip()`'s `scope.launch` + `jobs +=`, fired from an event-collector job that hadn't
+   yet observed its own cancellation) could land after the snapshot and never get joined — so
+   `injector.close()` could still run concurrently with that straggler's in-flight `write()` even
+   though the code looked like it "joined everything first".
+
+**Fix discipline applied**:
+- `TelephonyTxInjector`/`LoopbackInjector`: one `ReentrantLock` guarding every access to the
+  track (`open`/`write`/`flush`/`close`/`probe`/`getRoutedDevice`/`openSampleRateHz`), plus a
+  `@Volatile closed` flag checked first in every method. `close()` sets `closed` then
+  `stop()`+`release()`s under the same lock, so a write already in flight (one short ~20 ms
+  chunk) finishes before `close()` can proceed, and anything called after `close()` is a no-op
+  rather than touching a released track. `TelephonyTxInjector` also grew a small `TrackHandle`
+  seam (real `AudioTrack` wrapped behind an interface, injectable via a `trackFactory`
+  constructor param) purely so a unit test can fake "was this called after release" — a real
+  `AudioTrack`'s post-release behavior is native/undefined and can't be asserted on off-device.
+- `IncallMusicInjector`: no change needed — it never constructs a real `AudioTrack` (Route A is
+  not implementable from an app process, see its class doc); `write`/`close` are already no-ops.
+- `VoiceCallCapture`: audited, no change needed — `start()`/`stop()` are already `@Synchronized`
+  and already stop the `AudioRecord` before joining the read thread, with a "leak rather than
+  release-out-from-under-an-in-flight-read" fallback if the thread doesn't exit within
+  `STOP_JOIN_TIMEOUT_MS` (5 s). This predates this fix and already matches the discipline above.
+- `BridgeSession.stop()`: job-drain loop now snapshots/cancels/joins `jobs` repeatedly to a fixed
+  point (bounded by `MAX_STOP_DRAIN_PASSES = 20`) instead of a single pass, so a straggler job
+  added mid-teardown is caught before `injector.flush()`/`close()` run.
+- New test: `audio/TelephonyTxInjectorConcurrencyTest` — 20 iterations of 6 threads hammering
+  `write()`/`flush()` against a fake `TrackHandle` while a 7th thread calls `close()`
+  concurrently (no delay — closing races the very first writes), asserting zero
+  post-`release()` calls each iteration. Passes.
+- **Unverified**: only unit-tested (Robolectric/JVM fakes); not yet re-run on the pilot phone
+  against a live call. The native crash itself can't be reproduced off-device — the fix should be
+  spot-checked against the same barge-in/hangup-during-wait-clip scenario before the next pilot
+  session.
